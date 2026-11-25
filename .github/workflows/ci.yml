@@ -55,7 +55,6 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: sbs-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CI_WEB_PORT: "18080"
-      ENV_FILE: ${{ runner.temp }}/sbs-ci.env
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,6 +62,8 @@ jobs:
       - name: Prepare ephemeral CI environment file
         run: |
           umask 077
+          ENV_FILE="${RUNNER_TEMP}/sbs-ci.env"
+          echo "ENV_FILE=${ENV_FILE}" >> "${GITHUB_ENV}"
           PG_PASSWORD="$(openssl rand -hex 32)"
           echo "::add-mask::${PG_PASSWORD}"
           printf '%s\n' \
@@ -189,5 +190,8 @@ jobs:
       - name: Stop Compose stack and remove temporary env file
         if: always()
         run: |
-          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml down --remove-orphans || true
-          rm -f "${ENV_FILE}"
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml down --remove-orphans || true
+            rm -f "${ENV_TARGET}"
+          fi

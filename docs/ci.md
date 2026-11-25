@@ -38,7 +38,7 @@ Pipeline terdiri dari dua job berurutan pada runner `ubuntu-latest` dengan `perm
 
 ### Job 2: `Docker Compose Integration` (`docker-compose-integration`)
 Berjalan setelah `Quality Gate` lulus:
-1. **Environment Sementara:** Membuat file env sementara di `${{ runner.temp }}/sbs-ci.env` dengan permission `600` dan password acak (`openssl rand -hex 32`) yang di-mask (`::add-mask::`).
+1. **Environment Sementara:** Membuat file env sementara di `$RUNNER_TEMP/sbs-ci.env` dengan permission `600` dan password acak (`openssl rand -hex 32`) yang di-mask (`::add-mask::`).
 2. **Validasi Konfigurasi:** Memeriksa `compose.yaml` maupun gabungan `compose.yaml` + `compose.dev.yaml` menggunakan `docker compose ... config --quiet`.
 3. **Full Stack Build & Startup:** Menjalankan `compose.yaml` saja (`build` + `up -d`) dengan project name unik `sbs-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}` lalu polling status hingga `db`, `api`, dan `web` ketiganya berstatus `running` (`healthy`).
 4. **Endpoint & PostgreSQL Smoke Test:**
