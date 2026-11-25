@@ -109,7 +109,7 @@ SistemBimbinganSkripsi/
 ## Prasyarat
 
 - **Git**
-- **Node.js** `>= 20` (LTS) dan **npm** `>= 10`
+- **Node.js** `>= 22` (LTS) dan **npm** `>= 10`
 - **Docker Engine** dan **Docker Compose** v2 (`docker compose`)
 
 ---

@@ -19,7 +19,7 @@ flowchart LR
 
 | Service | Image / Build | Jaringan | Port Host | Volume Persisten |
 |---|---|---|---|---|
-| `web` | `client/Dockerfile` (`nginxinc/nginx-unprivileged:1.27-alpine`) | `frontend`, `internal` | `${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080` | — |
+| `web` | `client/Dockerfile` (`nginxinc/nginx-unprivileged:1.30.6-alpine`) | `frontend`, `internal` | `${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080` | — |
 | `api` | `server/Dockerfile` (`node:22-slim`, non-root `node`) | `internal` | Tidak dibuka | `sbs_uploads` -> `/app/storage/revisions` |
 | `db` | `postgres:16-alpine` | `internal` | Tidak dibuka | `sbs_pgdata` -> `/var/lib/postgresql/data` |
 

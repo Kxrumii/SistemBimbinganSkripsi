@@ -4,7 +4,7 @@ Direktori ini disiapkan untuk artefak konfigurasi infrastruktur dan operasional 
 
 ## Batas Jaringan & Runtime Kontainer (`SBS-04`)
 
-- **`web` (`client/Dockerfile`):** Menjalankan Nginx non-root (`nginxinc/nginx-unprivileged:1.27-alpine`) pada port kontainer `8080`, melayani static build React/Vite, dan mem-proxy `/api/` ke `http://api:${API_PORT}`. Hanya service `web` yang di-bind ke host melalui loopback (`${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080`).
+- **`web` (`client/Dockerfile`):** Menjalankan Nginx non-root (`nginxinc/nginx-unprivileged:1.30.6-alpine`) pada port kontainer `8080`, melayani static build React/Vite, dan mem-proxy `/api/` ke `http://api:${API_PORT}`. Hanya service `web` yang di-bind ke host melalui loopback (`${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080`).
 - **`api` (`server/Dockerfile`):** Menjalankan Express.js + TypeScript sebagai user non-root `node` hanya pada jaringan `internal`, dengan volume privat `sbs_uploads` pada `/app/storage/revisions`.
 - **`db` (`postgres:16-alpine`):** Berjalan hanya pada jaringan `internal` dengan named volume `sbs_pgdata`.
 
