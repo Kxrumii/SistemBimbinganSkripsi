@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { after, before, describe, it } from 'node:test';
 import { createApp } from '../app.js';
 import { loadEnv, type AppEnv } from '../config/env.js';
+import { createErrorHandler, redactSensitiveMessage } from '../middlewares/errorHandler.js';
 
 const TEST_CONFIG: AppEnv = {
   nodeEnv: 'test',
@@ -140,5 +141,93 @@ describe('Express API foundation', () => {
     const body = (await res.json()) as { success: boolean; error: { code: string } };
     assert.equal(body.success, false);
     assert.equal(body.error.code, 'INVALID_JSON');
+  });
+});
+
+describe('Error logging safeguards', () => {
+  it('redacts connection strings, bearer tokens, and secrets', () => {
+    const raw =
+      'Failed connecting postgresql://u:SuperSecret99@db:5432/sbs with Bearer tok123 and password=my_pw';
+    const safe = redactSensitiveMessage(raw);
+    assert.equal(safe.includes('SuperSecret99'), false);
+    assert.equal(safe.includes('tok123'), false);
+    assert.equal(safe.includes('my_pw'), false);
+    assert.ok(safe.includes('[REDACTED]'));
+  });
+
+  it('keeps production 500 responses and logs free of raw error messages or secrets', () => {
+    const logs: unknown[][] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args);
+    };
+
+    try {
+      let capturedStatus = 0;
+      let capturedBody: unknown = null;
+      const fakeRes = {
+        status(code: number) {
+          capturedStatus = code;
+          return this;
+        },
+        json(payload: unknown) {
+          capturedBody = payload;
+        },
+      };
+      const fakeReq = { method: 'GET', path: '/api/v1/health' };
+      const handler = createErrorHandler('production');
+      handler(
+        new Error('Connect failed: postgresql://sbs_user:SuperSecret99@db:5432/sbs'),
+        fakeReq as never,
+        fakeRes as never,
+        (() => {}) as never,
+      );
+
+      assert.equal(capturedStatus, 500);
+      assert.deepEqual(capturedBody, {
+        success: false,
+        error: {
+          code: 'INTERNAL_SERVER_ERROR',
+          message: 'Terjadi kesalahan internal pada server',
+        },
+      });
+      const serializedLogs = JSON.stringify(logs);
+      assert.equal(serializedLogs.includes('SuperSecret99'), false);
+      assert.equal(serializedLogs.includes('Connect failed'), false);
+      assert.equal(serializedLogs.includes('postgresql://'), false);
+    } finally {
+      console.error = origError;
+    }
+  });
+
+  it('redacts sensitive details in development error logs', () => {
+    const logs: unknown[][] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args);
+    };
+
+    try {
+      const fakeRes = {
+        status() {
+          return this;
+        },
+        json() {},
+      };
+      const fakeReq = { method: 'POST', path: '/api/v1/test' };
+      const handler = createErrorHandler('development');
+      handler(
+        new Error('Database error at postgresql://sbs_user:SuperSecret99@db:5432/sbs'),
+        fakeReq as never,
+        fakeRes as never,
+        (() => {}) as never,
+      );
+
+      const serializedLogs = JSON.stringify(logs);
+      assert.equal(serializedLogs.includes('SuperSecret99'), false);
+      assert.ok(serializedLogs.includes('[REDACTED]'));
+    } finally {
+      console.error = origError;
+    }
   });
 });

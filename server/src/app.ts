@@ -2,7 +2,7 @@ import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
 import type { AppEnv } from './config/env.js';
-import { errorHandler } from './middlewares/errorHandler.js';
+import { createErrorHandler } from './middlewares/errorHandler.js';
 import { notFoundHandler } from './middlewares/notFound.js';
 import { apiRouter } from './routes/index.js';
 
@@ -27,7 +27,7 @@ export function createApp(config: AppEnv): express.Express {
   app.use('/api/v1', apiRouter);
 
   app.use(notFoundHandler);
-  app.use(errorHandler);
+  app.use(createErrorHandler(config.nodeEnv));
 
   return app;
 }
