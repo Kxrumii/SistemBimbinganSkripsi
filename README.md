@@ -44,7 +44,9 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 ```text
 SistemBimbinganSkripsi/
 ├── .github/
-│   └── pull_request_template.md   # Template Pull Request
+│   ├── pull_request_template.md   # Template Pull Request
+│   └── workflows/
+│       └── ci.yml                 # GitHub Actions CI (Quality Gate & Docker Compose Integration)
 ├── .gitattributes                 # Normalisasi line ending dan aturan file biner
 ├── .gitignore                     # Pengecualian node_modules, dist, .env, dan storage
 ├── .dockerignore                  # Pengecualian artefak lokal pada build context Docker
@@ -91,6 +93,7 @@ SistemBimbinganSkripsi/
 ├── infra/
 │   └── README.md                  # Catatan batas jaringan kontainer untuk SBS-14 & SBS-15
 └── docs/
+    ├── ci.md                      # Panduan GitHub Actions CI dan troubleshooting
     ├── deployment.md              # Panduan Mode A (Dev Lokal) & Mode B (Full Compose)
     └── testing.md                 # Panduan verifikasi aplikasi, Compose, dan smoke test
 ```
@@ -220,8 +223,19 @@ Perintah per workspace:
 
 ---
 
+## 7. Continuous Integration (GitHub Actions)
+
+Setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`) menjalankan workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) dengan dua job berurutan:
+- **`Quality Gate`:** `npm ci`, `npm run typecheck`, `npm run lint`, `npm run build`, dan `npm test` pada Node.js `22.x`.
+- **`Docker Compose Integration`:** validasi `compose.yaml` dan `compose.dev.yaml`, build image `web`/`api`, verifikasi status `healthy` pada `db`/`api`/`web`, smoke test endpoint `/`, `/healthz`, `/api/v1/health`, pengecekan `pg_isready` + `SELECT 1`, serta verifikasi isolasi port, network `Internal=true`, dan mount volume.
+
+Pipeline CI ini tidak melakukan deployment ke server atau publish image ke container registry. Panduan lengkap tersedia pada [Dokumentasi CI](docs/ci.md).
+
+---
+
 ## Dokumentasi Terkait
 
+- [Panduan GitHub Actions CI](docs/ci.md)
 - [Panduan Deployment & Mode Operasional](docs/deployment.md)
 - [Panduan & Log Pengujian](docs/testing.md)
 - [Kontrak Database (`database/README.md`)](database/README.md)

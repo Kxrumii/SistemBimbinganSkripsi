@@ -62,9 +62,12 @@ Daftar pemeriksaan yang wajib lulus:
 
 ---
 
-## 4. Ruang Lingkup Pengujian Issue Berikutnya
+## 4. Pemisahan Pengujian Lokal, Automated CI, dan Cakupan Pasca-`SBS-19`
 
-Pengujian fitur bisnis (schema/integritas database `SBS-19`, auth/JWT/CSRF/RBAC `SBS-05`–`SBS-06`, workflow akademik `SBS-07`–`SBS-11`, shared UI `SBS-12`, serta deployment domain online `SBS-13`–`SBS-15`) dilakukan pada masing-masing Issue.
+1. **Pengujian Lokal Pengembang:** Dijalankan manual sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` / Mode B `compose.yaml`).
+2. **Automated CI Application Checks (`Quality Gate` pada GitHub Actions):** Berjalan otomatis pada `pull_request` dan `push` ke `main` dengan Node.js `22.x`, menjalankan `npm ci`, `typecheck`, `lint`, `build`, dan unit tests.
+3. **Automated CI Docker Integration Checks (`Docker Compose Integration` pada GitHub Actions):** Memvalidasi `compose.yaml` dan `compose.dev.yaml`, mem-build image, menunggu `db`/`api`/`web` menjadi `healthy`, memverifikasi `/`, `/healthz`, `/api/v1/health`, memeriksa `pg_isready` & `SELECT 1` pada PostgreSQL, serta memverifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
+4. **Pengujian Schema, Migration & Integritas Database (Menunggu `SBS-19`):** Validasi schema Prisma (`prisma validate`), migration PostgreSQL (`prisma migrate deploy`), seed data sintetis, dan uji constraint/relasi belum dijalankan oleh CI sampai `SBS-19` tersedia di `main`. Pengujian fitur bisnis (`SBS-05`–`SBS-12`) serta domain online (`SBS-13`–`SBS-15`) menyusul pada Issue masing-masing.
 
 ---
 
