@@ -6,6 +6,7 @@ export type NodeEnv = 'development' | 'test' | 'production';
 
 export interface AppEnv {
   nodeEnv: NodeEnv;
+  apiHost: string;
   apiPort: number;
   clientOrigin: string;
   databaseUrl: string;
@@ -25,6 +26,14 @@ function parseNodeEnv(rawValue: string | undefined): NodeEnv {
     throw new Error('NODE_ENV must be one of development, test, or production');
   }
   return value as NodeEnv;
+}
+
+function parseApiHost(rawValue: string | undefined): string {
+  const value = (rawValue ?? '127.0.0.1').trim();
+  if (!value || value === '*' || value.includes('://') || !/^[a-zA-Z0-9.:-]+$/.test(value)) {
+    throw new Error('API_HOST must be a valid bind IP or hostname without scheme or whitespace');
+  }
+  return value;
 }
 
 function parsePort(rawValue: string | undefined): number {
@@ -97,17 +106,27 @@ export function loadEnv(envSource: NodeJS.ProcessEnv = process.env): AppEnv {
   };
 
   const nodeEnv = capture(() => parseNodeEnv(envSource.NODE_ENV));
+  const apiHost = capture(() => parseApiHost(envSource.API_HOST));
   const apiPort = capture(() => parsePort(envSource.API_PORT));
   const clientOrigin = capture(() => parseClientOrigin(envSource.CLIENT_ORIGIN));
   const databaseUrl = capture(() => parseDatabaseUrl(envSource.DATABASE_URL));
   const uploadDir = capture(() => parseUploadDir(envSource.UPLOAD_DIR));
 
-  if (errors.length > 0 || !nodeEnv || !apiPort || !clientOrigin || !databaseUrl || !uploadDir) {
+  if (
+    errors.length > 0 ||
+    !nodeEnv ||
+    !apiHost ||
+    !apiPort ||
+    !clientOrigin ||
+    !databaseUrl ||
+    !uploadDir
+  ) {
     throw new Error(`Invalid startup environment configuration: ${errors.join('; ')}`);
   }
 
   return {
     nodeEnv,
+    apiHost,
     apiPort,
     clientOrigin,
     databaseUrl,

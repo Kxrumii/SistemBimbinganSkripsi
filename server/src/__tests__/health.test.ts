@@ -6,6 +6,7 @@ import { loadEnv, type AppEnv } from '../config/env.js';
 
 const TEST_CONFIG: AppEnv = {
   nodeEnv: 'test',
+  apiHost: '127.0.0.1',
   apiPort: 3000,
   clientOrigin: 'http://localhost:5173',
   databaseUrl: 'postgresql://test_user:test_pass@localhost:5432/sbs_test?schema=public',
@@ -13,7 +14,7 @@ const TEST_CONFIG: AppEnv = {
 };
 
 describe('loadEnv validation', () => {
-  it('parses valid environment configuration', () => {
+  it('parses valid environment configuration with default API_HOST 127.0.0.1', () => {
     const config = loadEnv({
       NODE_ENV: 'production',
       API_PORT: '4000',
@@ -23,9 +24,29 @@ describe('loadEnv validation', () => {
     });
 
     assert.equal(config.nodeEnv, 'production');
+    assert.equal(config.apiHost, '127.0.0.1');
     assert.equal(config.apiPort, 4000);
     assert.equal(config.clientOrigin, 'https://sbs.example.test');
     assert.equal(config.uploadDir, '/app/storage/revisions');
+  });
+
+  it('accepts explicit API_HOST for container binding and rejects invalid API_HOST', () => {
+    const containerConfig = loadEnv({
+      API_HOST: '0.0.0.0',
+      DATABASE_URL: 'postgresql://u:p@db:5432/sbs',
+      UPLOAD_DIR: '/app/storage/revisions',
+    });
+    assert.equal(containerConfig.apiHost, '0.0.0.0');
+
+    assert.throws(
+      () =>
+        loadEnv({
+          API_HOST: 'http://127.0.0.1',
+          DATABASE_URL: 'postgresql://u:p@db:5432/sbs',
+          UPLOAD_DIR: '/app/storage/revisions',
+        }),
+      /API_HOST must be a valid bind IP or hostname/,
+    );
   });
 
   it('rejects missing DATABASE_URL without leaking secrets', () => {
@@ -62,9 +83,10 @@ describe('Express API foundation', () => {
   before(async () => {
     const app = createApp(TEST_CONFIG);
     await new Promise<void>((resolve) => {
-      const server = app.listen(0, '127.0.0.1', () => {
+      const server = app.listen(0, TEST_CONFIG.apiHost, () => {
         const address = server.address() as AddressInfo;
-        baseUrl = `http://127.0.0.1:${address.port}`;
+        assert.equal(address.address, '127.0.0.1');
+        baseUrl = `http://${address.address}:${address.port}`;
         closeServer = () =>
           new Promise<void>((done, fail) => {
             server.close((err) => (err ? fail(err) : done()));
