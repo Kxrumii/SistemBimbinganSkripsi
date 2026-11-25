@@ -1,45 +1,88 @@
 # Panduan & Log Pengujian — Sistem Bimbingan Skripsi (Kelompok A4)
 
-> **Status:** Kerangka awal dokumen pengujian. Pengujian aplikasi belum dilakukan karena source code frontend, backend, database, dan endpoint belum dibuat.
+Dokumen ini mendefinisikan skenario verifikasi fondasi aplikasi dan containerization (`SBS-04`) serta mencatat hasil eksekusi aktual.
 
 ---
 
-## 1. Status Pengujian Saat Ini
+## 1. Perintah Verifikasi Aplikasi
 
-Belum ada pengujian aplikasi yang dijalankan. Repository saat ini masih berisi kerangka monorepo dan dokumentasi baseline.
+Jalankan seluruh pemeriksaan dari root repository setelah `npm ci`:
 
-## 2. Ruang Lingkup Pengujian Target
+```bash
+npm run typecheck
+npm run lint
+npm run build
+npm test
+```
 
-Saat aplikasi mulai diimplementasikan, pengujian akan mencakup skenario positif dan negatif untuk:
+### Cakupan Frontend (`client/`) & Backend (`server/`)
+- `typecheck` & `lint`: Validasi TypeScript strict serta ESLint (`react-hooks`, `react-refresh`, dan aturan unused vars) tanpa error/warning.
+- `build`: Menghasilkan `client/dist/` (Vite + Tailwind CSS v4) dan `server/dist/` (`tsc -p tsconfig.build.json`).
+- `npm test` (`server/src/__tests__/health.test.ts`):
+  - Validasi `loadEnv` (`NODE_ENV`, `API_HOST` default `127.0.0.1` dan override `0.0.0.0`, penolakan `API_HOST` tidak valid, `DATABASE_URL` wajib, `API_PORT`, serta penolakan `CLIENT_ORIGIN` wildcard `*`).
+  - `GET /api/v1/health` mengembalikan `200`, struktur JSON standar API Contract, dan bebas credential/path.
+  - Rute tidak dikenal mengembalikan `404` (`NOT_FOUND`) dan JSON rusak mengembalikan `400` (`INVALID_JSON`).
+  - Safeguard logging (`createErrorHandler`, `redactSensitiveMessage`): respons `500` generik; log production tidak mencetak `err.message` mentah maupun secret/URL database; log development meredaksi connection string, token, dan password.
 
-- **Autentikasi & Sesi:** Login, logout (penghapusan cookie dan pencabutan sesi di server), JWT pada `HttpOnly` `Secure` cookie, serta proteksi CSRF.
-- **Otorisasi & Batas Akses (RBAC):**
-  - `ADMIN`: mengelola pengguna, pengajuan, penetapan pembimbing, dan pemantauan keseluruhan.
-  - `DOSEN`: hanya mengakses mahasiswa yang sedang menjadi bimbingannya.
-  - `MAHASISWA`: hanya mengakses dan mengelola data skripsinya sendiri.
-- **Tujuh Fitur Wajib Kelompok A4:**
-  1. Pengajuan judul skripsi (maksimal satu pengajuan aktif per mahasiswa).
-  2. Persetujuan judul.
-  3. Penetapan dosen pembimbing (satu pembimbing utama aktif dengan histori assignment).
-  4. Jadwal bimbingan (pengajuan, konfirmasi, penolakan, dan usulan waktu baru).
-  5. Upload berkas revisi (PDF/DOCX, maksimal 10 MiB / `10.485.760` byte per file, penyimpanan privat dan berversi).
-  6. Catatan dosen (*append-only*).
-  7. Monitoring progres (tahapan proses dan histori milestone).
-- **Pencarian, Filter, & Persistensi Database:** Memastikan data tersimpan di PostgreSQL 16 melalui Prisma ORM.
-- **Pengujian Domain Online:** Verifikasi fungsional melalui `https://sbs.kxrumii.my.id` setelah deployment selesai.
+---
 
-## 3. Cara Menjalankan Pengujian
+## 2. Skenario Pengujian Development Lokal (Mode A)
 
-Bagian ini akan dilengkapi setelah setup project `client/` dan `server/` serta test runner tersedia.
+1. **Database Development (`compose.dev.yaml`):**
+   - Validasi config gabungan dengan project terisolasi:
+     `docker compose -p sbs04-dev-final -f compose.yaml -f compose.dev.yaml config --quiet`
+   - Jalankan `up -d db`; verifikasi `db` berstatus `healthy`, port hanya terikat ke `127.0.0.1:5432->5432/tcp` (bukan `0.0.0.0`), dan PostgreSQL merespons koneksi dari host `127.0.0.1:5432`.
+2. **API Bind Address Lokal & Vite Proxy:**
+   - Jalankan `npm run dev` dengan `API_HOST=127.0.0.1`.
+   - Verifikasi socket listener Express hanya pada `127.0.0.1:3000` (bukan `0.0.0.0:3000`).
+   - Verifikasi frontend `http://127.0.0.1:5173/` (`200`) dan Vite proxy `http://127.0.0.1:5173/api/v1/health` (`200` JSON `status: "ok"`).
+   - Hentikan DB uji dengan `stop db` tanpa menghapus volume.
 
-## 4. Standar Pencatatan Hasil Uji
+---
 
-Setiap laporan pengujian yang dicatat di dokumen ini perlu mencantumkan:
-- Tanggal dan lingkungan uji (lokal / staging / production `sbs.kxrumii.my.id`).
-- Command aktual yang dijalankan.
-- Hasil aktual (jumlah lulus/gagal sesuai hasil sebenarnya, tanpa menebak output).
-- Cakupan skenario positif dan negatif.
+## 3. Skenario Pengujian Full Stack Compose, Keamanan & Persistensi (Mode B)
+
+Gunakan project terisolasi (`-p sbs04-final`) dan file env sementara di luar Git:
+
+```bash
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final config --quiet
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final build
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final up -d
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final ps
+```
+
+Daftar pemeriksaan yang wajib lulus:
+1. **Healthcheck:** `db`, `api`, dan `web` ketiganya berstatus `running (healthy)`.
+2. **Endpoint & Proxy:** `/healthz` (`200 ok`), `/` (HTML starter), `/api/v1/health` (`200` JSON sesuai API Contract), `/api/v1/unknown` (`404 NOT_FOUND`).
+3. **Port Exposure & Network Isolation:** `db` dan `api` memiliki `host_published=[]`; `web` hanya mempublikasikan `127.0.0.1:${WEB_PORT}->8080/tcp`; jaringan `internal` memiliki `Internal=true`; `api` memakai hostname `db:5432`.
+4. **Nginx Upload Request Limit:** `docker compose ... exec -T web nginx -t` lulus, dan `nginx -T` menampilkan `client_max_body_size 12m;` pada scope `location /api/`. *(Limit bisnis 10 MiB tetap ditegakkan backend pada `SBS-09`; uji upload berkas sebenarnya bukan bagian `SBS-04`.)*
+5. **Non-root Runtime:** `api` berjalan sebagai `uid=1000(node)` dan `web` berjalan sebagai `uid=101(nginx)`.
+6. **Secrets & Image Hygiene:** `.env` tidak ada di image container (`/app/.env` absen), `docker compose logs` bebas credential, dan repo bebas penyebutan host privat serta bebas `localStorage`/`sessionStorage`.
+7. **Volume Persistence & Privasi Upload:** Tabel penanda sintetis pada `sbs_pgdata` dan file penanda pada `/app/storage/revisions` (`sbs_uploads`) bertahan setelah `restart db api` maupun `up -d --force-recreate`, tidak dapat diunduh melalui URL `web`, lalu dibersihkan sebelum `docker compose down` (tanpa `-v`).
+
+---
+
+## 4. Ruang Lingkup Pengujian Issue Berikutnya
+
+Pengujian fitur bisnis (schema/integritas database `SBS-19`, auth/JWT/CSRF/RBAC `SBS-05`–`SBS-06`, workflow akademik `SBS-07`–`SBS-11`, shared UI `SBS-12`, serta deployment domain online `SBS-13`–`SBS-15`) dilakukan pada masing-masing Issue.
+
+---
 
 ## 5. Log Hasil Pengujian
 
-Belum ada eksekusi pengujian aplikasi pada baseline awal repository.
+### Final Verification Gate `SBS-04` (26 November 2026)
+
+- **Aplikasi (`npm ci --offline`, `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`):**
+  - `npm ci --offline`: Lulus (`285` packages tersinkron dengan root `package-lock.json`).
+  - `npm run typecheck`: Lulus untuk `sbs-client` dan `sbs-server`.
+  - `npm run lint`: Lulus tanpa error maupun warning pada `client` dan `server`.
+  - `npm run build`: `client/dist/` (Vite `545ms`) dan `server/dist/` (`tsc -p tsconfig.build.json`) berhasil.
+  - `npm test`: `10/10` tests pada `3` suite lulus (`loadEnv validation` 4/4, `Express API foundation` 3/3, `Error logging safeguards` 3/3).
+- **Development Workflow (`-p sbs04-dev-final`, `compose.yaml` + `compose.dev.yaml`):**
+  - `docker compose ... up -d db`: PostgreSQL 16 berstatus `healthy`, port hanya terikat ke `127.0.0.1:5432->5432/tcp`, wire protocol pada `127.0.0.1:5432` merespons normal.
+  - `npm run dev` (`API_HOST=127.0.0.1`): Express mendengarkan pada `127.0.0.1:3000` (bukan `0.0.0.0`), `http://127.0.0.1:5173/` (`200` HTML), `http://127.0.0.1:5173/api/v1/health` (`200` JSON `status: "ok"`), dihentikan bersih via `stop db`.
+- **Full Stack Compose (`-p sbs04-final`, `compose.yaml` saja):**
+  - `docker compose ... config --quiet` & `build` & `up -d`: Ketiga service (`db`, `api`, `web`) mencapai status `running (healthy)`.
+  - Endpoint via `web`: `GET /healthz` (`200 ok`), `GET /` (`200` HTML), `GET /api/v1/health` (`200` JSON `status: "ok"`).
+  - Isolasi & Runtime: `api` dan `db` `host_published=[]`, jaringan `internal` memiliki `Internal=true`, `api` memakai host DB `db:5432`, `api` berjalan sebagai `uid=1000(node)`, `web` berjalan sebagai `uid=101(nginx)` (`nginx version: nginx/1.30.6`), `nginx -t` lulus, `nginx -T` memuat `client_max_body_size 12m;` pada `location /api/`.
+  - Keamanan & Persistensi: `.env` absen di image, log bebas credential, `git diff --check` bersih, `rg` bebas penyebutan host privat dan `localStorage`/`sessionStorage`; penanda sementara DB & `/app/storage/revisions` tidak bocor via `web`, bertahan setelah `restart db api` dan `up -d --force-recreate`, lalu dibersihkan sebelum `down` (tanpa `-v`).
