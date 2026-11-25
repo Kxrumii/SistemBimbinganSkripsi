@@ -225,9 +225,9 @@ Perintah per workspace:
 
 ## 7. Continuous Integration (GitHub Actions)
 
-Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan dua job berurutan: **`Quality Gate`** (aplikasi Node.js `22.x`) dan **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume).
+Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan tiga job: **`Quality Gate`** (typecheck, lint, build, dan unit tests Node.js `22.x`), kemudian **`Database Integration`** (PostgreSQL Mode A `127.0.0.1:5432`, proteksi anti-hapus schema, serta gate kondisional Prisma `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` mulai `SBS-19`) bersama **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume) secara paralel.
 
-Workflow ini tidak melakukan deployment ke server atau publish image ke container registry. Penjelasan detail, batas pengujian sebelum `SBS-19`, dan panduan troubleshooting tersedia pada [Dokumentasi CI](docs/ci.md).
+Workflow ini tidak melakukan deployment ke server atau publish image ke container registry. Penjelasan detail kontrak database, batas baseline sebelum `SBS-19`, dan panduan troubleshooting tersedia pada [Dokumentasi CI](docs/ci.md) serta [Panduan Pengujian](docs/testing.md).
 
 ---
 

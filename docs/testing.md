@@ -62,13 +62,19 @@ Daftar pemeriksaan yang wajib lulus:
 
 ---
 
-## 4. Pemisahan Pengujian Lokal, Automated CI Checks, dan Tahap Pasca-`SBS-19`
+## 4. Pemisahan Pengujian Lokal, Automated CI Checks, Database Integration, dan Pengujian Fitur
 
-1. **Pengujian lokal:** Dijalankan pengembang sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` atau Mode B `compose.yaml`).
-2. **Automated CI checks (GitHub Actions):** Berjalan otomatis pada `pull_request` dan `push` ke `main` melalui [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), mencakup:
-   - **`Quality Gate`:** `npm ci`, `typecheck`, `lint`, `build`, dan unit tests pada Node.js `22.x`.
-   - **`Docker Compose Integration`:** validasi `compose.yaml` dan `compose.dev.yaml`, build image, healthcheck `db`/`api`/`web`, smoke test `/`, `/healthz`, `/api/v1/health`, `pg_isready` & `SELECT 1`, serta verifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
-3. **Database schema, migration, dan integrity tests (menunggu `SBS-19`):** Pengujian Prisma (`prisma validate`, `prisma migrate deploy`, seed sintetis, serta uji constraint dan relasi database) belum tersedia dan belum dijalankan di CI sampai implementasi `SBS-19` di-merge ke `main`. Pengujian fitur bisnis (`SBS-05`–`SBS-12`) dan domain online (`SBS-13`–`SBS-15`) menyusul pada Issue masing-masing.
+Agar cakupan verifikasi antar tahap tidak tumpang tindih, proyek membagi lapisan pengujian sebagai berikut:
+
+1. **Pengujian lokal (Developer):** Dijalankan pengembang sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` atau Mode B `compose.yaml`).
+2. **Automated CI checks (GitHub Actions):** Berjalan otomatis pada `pull_request` dan `push` ke `main` melalui [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), mencakup tiga check:
+   - **`Quality Gate`:** `npm ci`, `typecheck`, `lint`, `build`, dan unit tests (`npm test`) pada Node.js `22.x`.
+   - **`Database Integration`:** Menjalankan service PostgreSQL Mode A (`compose.yaml` + `compose.dev.yaml`) secara terisolasi pada `127.0.0.1:5432`, memverifikasi readiness serta `SELECT 1` dari host runner, menegakkan proteksi anti-hapus schema terhadap base branch `main`, serta menjalankan gate kondisional Prisma.
+   - **`Docker Compose Integration`:** Validasi `compose.yaml` dan `compose.dev.yaml`, build image, healthcheck `db`/`api`/`web`, smoke test `/`, `/healthz`, `/api/v1/health`, `pg_isready` & `SELECT 1`, serta verifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
+3. **Database integration & integrity tests (`SBS-19`):**
+   - Sebelum `server/prisma/schema.prisma` tersedia (`SBS-19` belum di-merge), `Database Integration` hanya memverifikasi readiness PostgreSQL Mode A dan mencatat tahap Prisma sebagai tidak berlaku (`N/A`).
+   - Begitu `server/prisma/schema.prisma` tersedia pada `SBS-19` maupun PR setelahnya, CI mewajibkan keberadaan file migrasi (`server/prisma/migrations/**/migration.sql`), `server/prisma/seed.ts`, serta script nyata (non-placeholder) pada `server/package.json`, lalu mengeksekusi `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` pada `--workspace=server` terhadap PostgreSQL CI sementara.
+4. **Pengujian fitur bisnis dan deployment (`SBS-05`–`SBS-15`):** Pengujian autentikasi, alur bimbingan skripsi, upload revisi, notifikasi, serta validasi domain/deployment online dikerjakan bertahap pada Issue fitur dan infrastruktur masing-masing.
 
 ---
 
