@@ -47,6 +47,224 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+  database-integration:
+    name: Database Integration
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DB_COMPOSE_PROJECT: sbs-db-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare ephemeral DB CI environment file
+        run: |
+          umask 077
+          ENV_FILE="${RUNNER_TEMP}/sbs-db-ci.env"
+          echo "ENV_FILE=${ENV_FILE}" >> "${GITHUB_ENV}"
+          PG_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::${PG_PASSWORD}"
+          DATABASE_URL="postgresql://sbs_ci_user:${PG_PASSWORD}@127.0.0.1:5432/sbs_ci?schema=public"
+          echo "::add-mask::${DATABASE_URL}"
+          echo "DATABASE_URL=${DATABASE_URL}" >> "${GITHUB_ENV}"
+          printf '%s\n' \
+            "NODE_ENV=test" \
+            "WEB_BIND_ADDRESS=127.0.0.1" \
+            "WEB_PORT=18080" \
+            "API_PORT=3000" \
+            "CLIENT_ORIGIN=http://127.0.0.1:18080" \
+            "POSTGRES_DB=sbs_ci" \
+            "POSTGRES_USER=sbs_ci_user" \
+            "POSTGRES_PASSWORD=${PG_PASSWORD}" \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "UPLOAD_DIR=./storage/revisions" \
+            > "${ENV_FILE}"
+          chmod 600 "${ENV_FILE}"
+
+      - name: Validate Compose DB configuration
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+            -f compose.yaml -f compose.dev.yaml config --quiet
+
+      - name: Start isolated PostgreSQL service
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+            -f compose.yaml -f compose.dev.yaml up -d db
+
+      - name: Wait for PostgreSQL to become healthy
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["DB_COMPOSE_PROJECT"]
+          cmd = [
+              "docker", "compose", "--env-file", env_file, "-p", project,
+              "-f", "compose.yaml", "-f", "compose.dev.yaml", "ps", "--format", "json",
+          ]
+
+          deadline = time.time() + 120
+          statuses = {}
+          while time.time() < deadline:
+              out = subprocess.check_output(cmd, text=True).strip()
+              rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+              statuses = {r["Service"]: (r.get("State"), r.get("Health")) for r in rows}
+              if statuses == {"db": ("running", "healthy")}:
+                  print("PostgreSQL service healthy:", statuses)
+                  raise SystemExit(0)
+              time.sleep(2)
+          raise SystemExit(f"Timed out waiting for PostgreSQL health: {statuses}")
+          PY
+
+      - name: Verify PostgreSQL port binding and host-runner connectivity
+        run: |
+          python3 - <<'PY'
+          import json, os, socket, subprocess
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["DB_COMPOSE_PROJECT"]
+          cmd = [
+              "docker", "compose", "--env-file", env_file, "-p", project,
+              "-f", "compose.yaml", "-f", "compose.dev.yaml", "ps", "--format", "json",
+          ]
+          rows = [json.loads(line) for line in subprocess.check_output(cmd, text=True).splitlines() if line.strip()]
+          by_service = {r["Service"]: r for r in rows}
+          assert set(by_service.keys()) == {"db"}, f"Unexpected services started: {list(by_service.keys())}"
+
+          pubs = [p for p in (by_service["db"].get("Publishers") or []) if p.get("PublishedPort", 0) != 0]
+          assert len(pubs) == 1 and pubs[0]["URL"] == "127.0.0.1" and pubs[0]["PublishedPort"] == 5432, (
+              f"Expected db bound strictly to 127.0.0.1:5432, got: {pubs}"
+          )
+
+          with socket.create_connection(("127.0.0.1", 5432), timeout=5):
+              pass
+          print("Verified PostgreSQL bound to 127.0.0.1:5432 and accepting host TCP connections.")
+          PY
+
+          PSQL_URI="${DATABASE_URL%%\?*}"
+          echo "::add-mask::${PSQL_URI}"
+          if command -v pg_isready >/dev/null 2>&1 && command -v psql >/dev/null 2>&1; then
+            pg_isready -h 127.0.0.1 -p 5432 -U sbs_ci_user -d sbs_ci
+            test "$(psql "${PSQL_URI}" -Atc "SELECT 1;")" = "1"
+            echo "Host-runner pg_isready and psql SELECT 1 succeeded on 127.0.0.1:5432."
+          else
+            docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml exec -T db \
+              sh -c 'pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB" && test "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT 1;")" = "1"'
+            echo "Container pg_isready and psql SELECT 1 succeeded (host psql client unavailable)."
+          fi
+
+      - name: Check Prisma schema presence and run database integration suite
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          BASE_HAS_SCHEMA=false
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${BASE_SHA}" ]; then
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Base commit ${BASE_SHA} is missing from git history; cannot verify Prisma schema presence."
+              exit 1
+            fi
+            if git cat-file -e "${BASE_SHA}:server/prisma/schema.prisma" 2>/dev/null; then
+              BASE_HAS_SCHEMA=true
+            fi
+          fi
+
+          PR_HAS_SCHEMA=false
+          if [ -f "server/prisma/schema.prisma" ]; then
+            PR_HAS_SCHEMA=true
+          fi
+
+          echo "Database schema detection: EVENT_NAME=${EVENT_NAME}, BASE_HAS_SCHEMA=${BASE_HAS_SCHEMA}, PR_HAS_SCHEMA=${PR_HAS_SCHEMA}"
+
+          if [ "${BASE_HAS_SCHEMA}" = "true" ] && [ "${PR_HAS_SCHEMA}" = "false" ]; then
+            echo "::error::server/prisma/schema.prisma exists on base branch (${BASE_SHA}) and cannot be deleted to bypass Database Integration checks."
+            exit 1
+          fi
+
+          if [ "${PR_HAS_SCHEMA}" = "false" ]; then
+            echo "server/prisma/schema.prisma is not present on base or head yet; Prisma validate, migrate deploy, seed, and test:db are skipped (N/A) until SBS-19 lands."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import glob, json, os, re
+
+          errors = []
+
+          schema_path = "server/prisma/schema.prisma"
+          if not os.path.isfile(schema_path) or os.path.getsize(schema_path) == 0:
+              errors.append("server/prisma/schema.prisma must exist and be non-empty")
+
+          migrations = glob.glob("server/prisma/migrations/**/migration.sql", recursive=True)
+          if not migrations:
+              errors.append("server/prisma/migrations/ must contain at least one migration.sql file")
+
+          seed_path = "server/prisma/seed.ts"
+          if not os.path.isfile(seed_path) or os.path.getsize(seed_path) == 0:
+              errors.append("server/prisma/seed.ts must exist and be non-empty")
+
+          pkg_path = "server/package.json"
+          if not os.path.isfile(pkg_path):
+              errors.append("server/package.json must exist")
+          else:
+              with open(pkg_path, encoding="utf-8") as fh:
+                  scripts = json.load(fh).get("scripts") or {}
+              placeholder_re = re.compile(r"^\s*(?:true|:|exit\s+0|echo\b.*)\s*$", re.IGNORECASE)
+              for script_name in ("db:validate", "db:migrate:deploy", "db:seed", "test:db"):
+                  cmd = scripts.get(script_name)
+                  if not isinstance(cmd, str) or not cmd.strip():
+                      errors.append(f"server/package.json scripts.{script_name} is missing or empty")
+                  elif placeholder_re.match(cmd):
+                      errors.append(f"server/package.json scripts.{script_name} cannot be a placeholder no-op ({cmd!r})")
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}")
+              raise SystemExit(1)
+
+          print(f"Verified SBS-19 Prisma artifacts and server scripts ({len(migrations)} migration file(s) found).")
+          PY
+
+          npm run db:validate --workspace=server
+          npm run db:migrate:deploy --workspace=server
+          npm run db:seed --workspace=server
+          npm run test:db --workspace=server
+
+      - name: Collect safe diagnostics on failure
+        if: failure()
+        run: |
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-db-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml ps || true
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml logs --tail=50 db || true
+          fi
+
+      - name: Stop isolated PostgreSQL service and remove temporary env file
+        if: always()
+        run: |
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-db-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml down --remove-orphans || true
+            rm -f "${ENV_TARGET}"
+          fi
+
   docker-compose-integration:
     name: Docker Compose Integration
     needs: quality-gate
