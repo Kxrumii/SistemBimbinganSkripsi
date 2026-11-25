@@ -225,11 +225,9 @@ Perintah per workspace:
 
 ## 7. Continuous Integration (GitHub Actions)
 
-Setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`) menjalankan workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) dengan dua job berurutan:
-- **`Quality Gate`:** `npm ci`, `npm run typecheck`, `npm run lint`, `npm run build`, dan `npm test` pada Node.js `22.x`.
-- **`Docker Compose Integration`:** validasi `compose.yaml` dan `compose.dev.yaml`, build image `web`/`api`, verifikasi status `healthy` pada `db`/`api`/`web`, smoke test endpoint `/`, `/healthz`, `/api/v1/health`, pengecekan `pg_isready` + `SELECT 1`, serta verifikasi isolasi port, network `Internal=true`, dan mount volume.
+Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan dua job berurutan: **`Quality Gate`** (aplikasi Node.js `22.x`) dan **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume).
 
-Pipeline CI ini tidak melakukan deployment ke server atau publish image ke container registry. Panduan lengkap tersedia pada [Dokumentasi CI](docs/ci.md).
+Workflow ini tidak melakukan deployment ke server atau publish image ke container registry. Penjelasan detail, batas pengujian sebelum `SBS-19`, dan panduan troubleshooting tersedia pada [Dokumentasi CI](docs/ci.md).
 
 ---
 
