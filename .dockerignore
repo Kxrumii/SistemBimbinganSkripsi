@@ -32,8 +32,9 @@ coverage
 **/coverage
 *.tsbuildinfo
 
-# Docs, IDE, OS & private/temporary files
+# Docs, dev scripts, IDE, OS & private/temporary files
 docs
+scripts
 README.md
 .vscode
 .idea

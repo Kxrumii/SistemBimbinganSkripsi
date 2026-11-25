@@ -1,0 +1,31 @@
+{
+  "name": "sistem-bimbingan-skripsi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:client": "npm run dev --workspace=client",
+    "dev:server": "npm run dev --workspace=server",
+    "build": "npm run build --workspaces",
+    "build:client": "npm run build --workspace=client",
+    "build:server": "npm run build --workspace=server",
+    "typecheck": "npm run typecheck --workspaces",
+    "lint": "npm run lint --workspaces",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "eslint": "^9.20.0",
+    "globals": "^15.14.0",
+    "typescript-eslint": "^8.24.0"
+  }
+}
