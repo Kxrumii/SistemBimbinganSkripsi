@@ -5,7 +5,7 @@ Aplikasi web pengajuan judul dan pemantauan proses bimbingan skripsi untuk Tugas
 - **Repository:** https://github.com/Kxrumii/SistemBimbinganSkripsi
 - **Domain target:** `https://sbs.kxrumii.my.id` *(deployment produksi dijadwalkan pada `SBS-14`)*
 
-> **Status Repository:** Fondasi aplikasi (`client/`, `server/`) dan orkestrasi container Docker Compose (`compose.yaml`) tersedia pada branch kerja `SBS-04`. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
+> **Status Repository:** Fondasi aplikasi (`client/`, `server/`) dan orkestrasi container Docker Compose (`compose.yaml`, `compose.dev.yaml`) tersedia pada branch kerja `SBS-04`. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
 
 ---
 
@@ -33,8 +33,8 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 - **Backend:** Express.js + TypeScript (`server/`)
 - **ORM:** Prisma *(integrasi schema & migrasi pada `SBS-19`)*
 - **Database:** PostgreSQL 16 (`postgres:16-alpine` pada internal Docker network)
-- **Containerization:** Docker & Docker Compose (`client/Dockerfile`, `server/Dockerfile`, `compose.yaml`)
-- **Web Serving & Reverse Proxy Kontainer:** Nginx unprivileged (`client/nginx.conf`)
+- **Containerization:** Docker & Docker Compose (`client/Dockerfile`, `server/Dockerfile`, `compose.yaml`, `compose.dev.yaml`)
+- **Web Serving & Reverse Proxy Kontainer:** Nginx unprivileged (`nginxinc/nginx-unprivileged:1.30.6-alpine` pada `client/nginx.conf`)
 - **Lingkungan Deployment Target:** Server Linux dengan Docker Engine, Docker Compose, Nginx, dan Cloudflare Tunnel (`SBS-14`)
 
 ---
@@ -49,34 +49,39 @@ SistemBimbinganSkripsi/
 ├── .gitignore                     # Pengecualian node_modules, dist, .env, dan storage
 ├── .dockerignore                  # Pengecualian artefak lokal pada build context Docker
 ├── .env.example                   # Template placeholder environment variables
-├── compose.yaml                   # Orkestrasi service db, api, dan web
+├── compose.yaml                   # Orkestrasi utama full stack (db, api, web)
+├── compose.dev.yaml               # Override khusus dev lokal untuk akses db di 127.0.0.1:5432
 ├── package.json                   # Root npm workspaces dan scripts bersama
+├── package-lock.json              # Lockfile tunggal monorepo
 ├── scripts/
 │   └── dev.mjs                    # Runner development server client + server bersamaan
 ├── client/
-│   ├── Dockerfile                 # Multi-stage build frontend + Nginx non-root
-│   ├── nginx.conf                 # Static serving + proxy /api/ ke service api
+│   ├── Dockerfile                 # Multi-stage build frontend + Nginx 1.30.6 unprivileged
+│   ├── nginx.conf                 # Static SPA serving + proxy /api/ (client_max_body_size 12m)
 │   ├── eslint.config.js
 │   ├── index.html
 │   ├── package.json
 │   ├── tsconfig.json
+│   ├── tsconfig.app.json
+│   ├── tsconfig.node.json
 │   ├── vite.config.ts             # Konfigurasi Vite + Tailwind CSS + dev proxy /api
 │   └── src/
 │       ├── App.tsx                # Starter UI + pengecekan GET /api/v1/health
 │       ├── index.css
 │       ├── main.tsx
+│       ├── vite-env.d.ts
 │       └── lib/apiClient.ts       # HTTP client terpusat dengan prefix /api/v1
 ├── server/
-│   ├── Dockerfile                 # Multi-stage build backend Node.js non-root
+│   ├── Dockerfile                 # Multi-stage build backend Node.js 22 non-root
 │   ├── eslint.config.js
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── tsconfig.build.json
 │   └── src/
 │       ├── app.ts                 # Konfigurasi Express app, Helmet, CORS, prefix /api/v1
-│       ├── server.ts              # Startup server (listen 0.0.0.0) & graceful shutdown
+│       ├── server.ts              # Startup server (API_HOST:API_PORT) & graceful shutdown
 │       ├── config/env.ts          # Pemuatan & validasi environment variables saat startup
-│       ├── middlewares/           # notFoundHandler dan errorHandler
+│       ├── middlewares/           # notFoundHandler dan createErrorHandler (redaksi log)
 │       ├── modules/               # Direktori modul fitur (SBS-05 s.d. SBS-11)
 │       ├── routes/                # Router dasar & GET /api/v1/health
 │       ├── utils/appError.ts
@@ -86,92 +91,121 @@ SistemBimbinganSkripsi/
 ├── infra/
 │   └── README.md                  # Catatan batas jaringan kontainer untuk SBS-14 & SBS-15
 └── docs/
-    ├── deployment.md              # Panduan Docker Compose, healthcheck, dan persistensi
+    ├── deployment.md              # Panduan Mode A (Dev Lokal) & Mode B (Full Compose)
     └── testing.md                 # Panduan verifikasi aplikasi, Compose, dan smoke test
 ```
-
----
-
-## Status Implementasi Aktual
-
-| Area | Status Saat Ini | Keterangan |
-|---|---|---|
-| Bootstrap Repository (`SBS-01`) | Selesai | Struktur monorepo, ignore files, `.env.example`, template PR tersedia. |
-| Proposal & Dokumentasi (`SBS-02`) | Selesai | Proposal, analisis kebutuhan, dan dokumentasi proyek disusun. |
-| Use Case, ERD & Kontrak (`SBS-03`) | Pending | Menunggu pengerjaan Paket 1. |
-| Application Foundation & Containerization (`SBS-04`) | Siap direview | Workspace `client/`, `server/`, `Dockerfile`, `compose.yaml`, healthcheck, dan uji persistensi terverifikasi pada branch `SBS-04`. |
-| Database Prisma (`SBS-19`) | Pending | Menunggu pengerjaan Paket 1 (menggunakan `DATABASE_URL` dan service `db`). |
-| Autentikasi & Fitur Bisnis (`SBS-05`–`SBS-12`) | Pending | Menunggu pengerjaan Paket 3–6 pada direktori `server/src/modules/` dan `client/src/`. |
-| Integrasi, Keamanan & Deployment (`SBS-13`–`SBS-15`) | Pending | Dikerjakan setelah modul inti selesai. |
 
 ---
 
 ## Prasyarat
 
 - **Git**
-- **Node.js** `>= 22` (LTS) dan **npm** `>= 10`
+- **Node.js** `>= 22.0.0` (LTS) dan **npm** `>= 10.0.0`
 - **Docker Engine** dan **Docker Compose** v2 (`docker compose`)
+- **OpenSSL** *(untuk menghasilkan password acak URL-safe)*
 
 ---
 
-## Instalasi Dependency & Pengembangan Lokal
+## 1. Clone Repository dan Checkout Branch Issue
 
-1. Clone repository dan checkout branch Issue Anda:
-   ```bash
-   git clone https://github.com/Kxrumii/SistemBimbinganSkripsi.git
-   cd SistemBimbinganSkripsi
-   git fetch origin
-   ```
-2. Install seluruh dependency monorepo dari root (menggunakan satu root `package-lock.json`):
-   ```bash
-   npm install
-   ```
-3. Salin template environment menjadi `.env` dan sesuaikan nilai placeholder (`CHANGE_ME_*`):
+Setiap Issue dikerjakan pada remote branch yang sudah disiapkan oleh Project Owner. **Jangan** membuat branch baru secara manual menggunakan `git switch -c`.
+
+Contoh untuk `SBS-04` (`#4`):
+
+```bash
+git clone https://github.com/Kxrumii/SistemBimbinganSkripsi.git
+cd SistemBimbinganSkripsi
+git fetch origin
+git switch --track origin/issue/4-app-foundation-docker
+```
+
+Untuk anggota yang mengerjakan Issue lain, ganti `issue/4-app-foundation-docker` dengan nama branch Issue Anda sesuai daftar branch resmi tim (misalnya `issue/5-authentication-rbac` untuk `#5`). Jika branch Anda belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
+
+---
+
+## 2. Instalasi Dependency
+
+Install seluruh dependency monorepo dari root menggunakan root `package-lock.json` tunggal:
+
+```bash
+npm ci
+```
+
+*(Gunakan `npm install` hanya saat menambahkan atau memperbarui dependency sesuai persetujuan Issue terkait.)*
+
+---
+
+## 3. Konfigurasi Environment (`.env`)
+
+1. Salin template environment di root repository:
    ```bash
    cp .env.example .env
    ```
-   > Pastikan `.env` tidak pernah di-commit ke Git.
+2. Buat password PostgreSQL acak yang URL-safe (hex tanpa karakter khusus yang memecah URL):
+   ```bash
+   openssl rand -hex 32
+   ```
+3. Buka `.env`, pertahankan `POSTGRES_DB` dan `POSTGRES_USER` sebagai identifier sederhana (`[a-z0-9_]+`), lalu isi password hasil `openssl rand -hex 32` yang **sama persis** ke:
+   - `POSTGRES_PASSWORD`
+   - segmen password pada `DATABASE_URL` (`postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>?schema=public`)
 
-4. Jalankan mode development:
-   - **Frontend dan backend sekaligus:**
-     ```bash
-     npm run dev
-     ```
-   - **Terpisah per workspace:**
-     ```bash
-     npm run dev:server
-     npm run dev:client
-     ```
-   - Frontend dev berjalan di `http://localhost:5173` dan meneruskan request `/api/*` ke `http://127.0.0.1:3000` (sesuai `API_PORT`).
-   - Backend API mensyaratkan `DATABASE_URL` berformat `postgres://` atau `postgresql://` serta `UPLOAD_DIR` terdefinisi di `.env` saat startup.
+> Jangan pernah meng-commit `.env` atau credential asli ke repository Git.
 
 ---
 
-## Menjalankan Stack dengan Docker Compose
+## 4. Menjalankan Database Development & Aplikasi Lokal
 
-1. Pastikan file `.env` sudah terisi nilai non-placeholder untuk `POSTGRES_DB`, `POSTGRES_USER`, dan `POSTGRES_PASSWORD`. Jika menguji akses melalui Compose pada host yang sama, Anda dapat menyesuaikan `CLIENT_ORIGIN=http://127.0.0.1:8080`.
-2. Validasi konfigurasi, build image, dan jalankan seluruh service:
+Gunakan workflow **Mode A (Development Lokal)** agar database PostgreSQL berjalan terisolasi pada loopback `127.0.0.1:5432` tanpa mengubah isolasi `compose.yaml` utama:
+
+1. Nyalakan service database development (menggunakan project name terpisah `sbs-dev`):
+   ```bash
+   npm run dev:db:up
+   ```
+2. Jalankan frontend Vite dan backend Express secara bersamaan:
+   ```bash
+   npm run dev
+   ```
+   Atau jalankan secara terpisah:
+   ```bash
+   npm run dev:server
+   npm run dev:client
+   ```
+   - Backend API mendengarkan pada `127.0.0.1:3000` (`API_HOST=127.0.0.1` secara default di `.env`).
+   - Frontend dev berjalan di `http://127.0.0.1:5173` dan meneruskan request `/api/*` ke backend melalui Vite proxy.
+3. Setelah selesai bekerja, hentikan database development **tanpa menghapus volume data**:
+   ```bash
+   npm run dev:db:down
+   ```
+
+---
+
+## 5. Menjalankan Stack Penuh dengan Docker Compose
+
+Untuk menguji seluruh stack container (`web`, `api`, dan `db`) sesuai kondisi produksi lokal, gunakan `compose.yaml` saja (**jangan** menyertakan `compose.dev.yaml`):
+
+1. Pastikan `.env` sudah terisi credential valid. Jika menguji akses melalui `web` pada host yang sama, atur `CLIENT_ORIGIN=http://127.0.0.1:8080`.
+2. Validasi, build, dan jalankan seluruh service:
    ```bash
    docker compose config --quiet
    docker compose up -d --build
    docker compose ps
    ```
-3. Verifikasi akses lokal (hanya service `web` yang di-bind ke loopback `127.0.0.1:${WEB_PORT:-8080}`):
+3. Verifikasi endpoint melalui satu listener loopback (`127.0.0.1:${WEB_PORT:-8080}`):
    - Frontend: `http://127.0.0.1:8080/`
-   - Nginx readiness: `http://127.0.0.1:8080/healthz`
-   - API health melalui reverse proxy: `http://127.0.0.1:8080/api/v1/health`
-4. Lihat log atau hentikan container tanpa menghapus volume data:
+   - Nginx health: `http://127.0.0.1:8080/healthz`
+   - API health melalui proxy: `http://127.0.0.1:8080/api/v1/health`
+4. Lihat log atau hentikan container tanpa menghapus volume:
    ```bash
    docker compose logs -f
    docker compose down
    ```
-   > **Peringatan:** Jangan menjalankan `docker compose down -v` pada lingkungan yang sudah menyimpan data karena `-v` akan menghapus named volume `sbs_pgdata` dan `sbs_uploads`.
+   > **Peringatan:** Jangan menjalankan `docker compose down -v` atau `docker volume prune` karena akan menghapus named volume `sbs_pgdata` dan `sbs_uploads`.
 
 ---
 
-## Perintah Build dan Verifikasi
+## 6. Perintah Build dan Verifikasi
 
-Jalankan dari root repository:
+Jalankan dari root repository sebelum membuat Pull Request:
 
 ```bash
 npm run typecheck
@@ -180,7 +214,7 @@ npm run build
 npm test
 ```
 
-Command per workspace juga tersedia:
+Perintah per workspace:
 - `npm run build:client`
 - `npm run build:server`
 
@@ -188,6 +222,8 @@ Command per workspace juga tersedia:
 
 ## Dokumentasi Terkait
 
-- [Panduan Deployment & Operasional Kontainer](docs/deployment.md)
+- [Panduan Deployment & Mode Operasional](docs/deployment.md)
 - [Panduan & Log Pengujian](docs/testing.md)
+- [Kontrak Database (`database/README.md`)](database/README.md)
+- [Kontrak Infrastruktur (`infra/README.md`)](infra/README.md)
 - [Template Pull Request](.github/pull_request_template.md)

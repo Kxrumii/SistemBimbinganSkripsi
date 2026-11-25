@@ -1,12 +1,12 @@
 # Panduan & Log Pengujian — Sistem Bimbingan Skripsi (Kelompok A4)
 
-Dokumen ini berisi panduan verifikasi untuk fondasi aplikasi (`SBS-04`) serta catatan hasil pengujian aktual yang benar-benar telah dijalankan.
+Dokumen ini mendefinisikan skenario verifikasi fondasi aplikasi dan containerization (`SBS-04`) serta mencatat hasil eksekusi aktual.
 
 ---
 
 ## 1. Perintah Verifikasi Aplikasi
 
-Jalankan seluruh pemeriksaan berikut dari root repository setelah `npm install`:
+Jalankan seluruh pemeriksaan dari root repository setelah `npm ci`:
 
 ```bash
 npm run typecheck
@@ -15,81 +15,74 @@ npm run build
 npm test
 ```
 
-### Cakupan Pemeriksaan Frontend (`client/`)
-- `npm run typecheck --workspace=client`: validasi TypeScript (`tsconfig.app.json` dan `tsconfig.node.json`).
-- `npm run lint --workspace=client`: validasi aturan ESLint, `react-hooks`, dan `react-refresh`.
-- `npm run build --workspace=client`: menghasilkan bundle produksi Vite + Tailwind CSS ke `client/dist/`.
-
-### Cakupan Pemeriksaan Backend (`server/`)
-- `npm run typecheck --workspace=server`: validasi TypeScript strict pada `server/src/`.
-- `npm run lint --workspace=server`: validasi ESLint pada `server/src/`.
-- `npm run build --workspace=server`: kompilasi TypeScript ke `server/dist/`.
-- `npm test --workspace=server`: menjalankan unit/integration test (`server/src/__tests__/health.test.ts`):
-  - Validasi environment positif dan negatif (`loadEnv`: menolak `DATABASE_URL` kosong, `API_PORT` tidak valid, atau `CLIENT_ORIGIN` wildcard `*`).
-  - `GET /api/v1/health` mengembalikan HTTP `200`, struktur JSON konsisten, dan tidak membocorkan secret/path/config.
-  - Rute tidak dikenal mengembalikan `404` (`NOT_FOUND`).
-  - Payload JSON rusak mengembalikan `400` (`INVALID_JSON`).
+### Cakupan Frontend (`client/`) & Backend (`server/`)
+- `typecheck` & `lint`: Validasi TypeScript strict serta ESLint (`react-hooks`, `react-refresh`, dan aturan unused vars) tanpa error/warning.
+- `build`: Menghasilkan `client/dist/` (Vite + Tailwind CSS v4) dan `server/dist/` (`tsc -p tsconfig.build.json`).
+- `npm test` (`server/src/__tests__/health.test.ts`):
+  - Validasi `loadEnv` (`NODE_ENV`, `API_HOST` default `127.0.0.1` dan override `0.0.0.0`, penolakan `API_HOST` tidak valid, `DATABASE_URL` wajib, `API_PORT`, serta penolakan `CLIENT_ORIGIN` wildcard `*`).
+  - `GET /api/v1/health` mengembalikan `200`, struktur JSON standar API Contract, dan bebas credential/path.
+  - Rute tidak dikenal mengembalikan `404` (`NOT_FOUND`) dan JSON rusak mengembalikan `400` (`INVALID_JSON`).
+  - Safeguard logging (`createErrorHandler`, `redactSensitiveMessage`): respons `500` generik; log production tidak mencetak `err.message` mentah maupun secret/URL database; log development meredaksi connection string, token, dan password.
 
 ---
 
-## 2. Pemeriksaan Docker Compose & Smoke Test
+## 2. Skenario Pengujian Development Lokal (Mode A)
 
-Untuk menguji tanpa mengganggu volume aktif atau data lain, gunakan project name terisolasi (misalnya `-p sbs_smoke_sbs04`) dan file env sementara di luar Git:
+1. **Database Development (`compose.dev.yaml`):**
+   - Validasi config gabungan dengan project terisolasi:
+     `docker compose -p sbs04-dev-final -f compose.yaml -f compose.dev.yaml config --quiet`
+   - Jalankan `up -d db`; verifikasi `db` berstatus `healthy`, port hanya terikat ke `127.0.0.1:5432->5432/tcp` (bukan `0.0.0.0`), dan PostgreSQL merespons koneksi dari host `127.0.0.1:5432`.
+2. **API Bind Address Lokal & Vite Proxy:**
+   - Jalankan `npm run dev` dengan `API_HOST=127.0.0.1`.
+   - Verifikasi socket listener Express hanya pada `127.0.0.1:3000` (bukan `0.0.0.0:3000`).
+   - Verifikasi frontend `http://127.0.0.1:5173/` (`200`) dan Vite proxy `http://127.0.0.1:5173/api/v1/health` (`200` JSON `status: "ok"`).
+   - Hentikan DB uji dengan `stop db` tanpa menghapus volume.
+
+---
+
+## 3. Skenario Pengujian Full Stack Compose, Keamanan & Persistensi (Mode B)
+
+Gunakan project terisolasi (`-p sbs04-final`) dan file env sementara di luar Git:
 
 ```bash
-docker compose --env-file /tmp/sbs04-smoke.env -p sbs_smoke_sbs04 config --quiet
-docker compose --env-file /tmp/sbs04-smoke.env -p sbs_smoke_sbs04 build
-docker compose --env-file /tmp/sbs04-smoke.env -p sbs_smoke_sbs04 up -d
-docker compose --env-file /tmp/sbs04-smoke.env -p sbs_smoke_sbs04 ps
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final config --quiet
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final build
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final up -d
+docker compose --env-file /tmp/sbs04-final.env -p sbs04-final ps
 ```
 
-Pemeriksaan smoke test yang wajib lulus:
-1. Seluruh service (`db`, `api`, `web`) mencapai status `healthy`.
-2. Endpoint web & proxy merespons benar:
-   - `curl -fsS http://127.0.0.1:8080/healthz` -> `ok`
-   - `curl -fsS http://127.0.0.1:8080/` -> HTML starter aplikasi
-   - `curl -fsS http://127.0.0.1:8080/api/v1/health` -> JSON `success: true`, `data.status: "ok"`
-3. Isolasi port dan jaringan:
-   - Service `db` dan `api` tidak memiliki port binding ke host.
-   - Service `web` hanya mempublikasikan port ke `127.0.0.1`.
-   - Service `api` berjalan sebagai user non-root `node` dan `web` berjalan sebagai user non-root `nginx`.
-4. Kebersihan log dan image:
-   - `docker compose logs` tidak mencetak password database atau secret.
-   - File `.env` tidak ada di dalam image container.
+Daftar pemeriksaan yang wajib lulus:
+1. **Healthcheck:** `db`, `api`, dan `web` ketiganya berstatus `running (healthy)`.
+2. **Endpoint & Proxy:** `/healthz` (`200 ok`), `/` (HTML starter), `/api/v1/health` (`200` JSON sesuai API Contract), `/api/v1/unknown` (`404 NOT_FOUND`).
+3. **Port Exposure & Network Isolation:** `db` dan `api` memiliki `host_published=[]`; `web` hanya mempublikasikan `127.0.0.1:${WEB_PORT}->8080/tcp`; jaringan `internal` memiliki `Internal=true`; `api` memakai hostname `db:5432`.
+4. **Nginx Upload Request Limit:** `docker compose ... exec -T web nginx -t` lulus, dan `nginx -T` menampilkan `client_max_body_size 12m;` pada scope `location /api/`. *(Limit bisnis 10 MiB tetap ditegakkan backend pada `SBS-09`; uji upload berkas sebenarnya bukan bagian `SBS-04`.)*
+5. **Non-root Runtime:** `api` berjalan sebagai `uid=1000(node)` dan `web` berjalan sebagai `uid=101(nginx)`.
+6. **Secrets & Image Hygiene:** `.env` tidak ada di image container (`/app/.env` absen), `docker compose logs` bebas credential, dan repo bebas penyebutan host privat serta bebas `localStorage`/`sessionStorage`.
+7. **Volume Persistence & Privasi Upload:** Tabel penanda sintetis pada `sbs_pgdata` dan file penanda pada `/app/storage/revisions` (`sbs_uploads`) bertahan setelah `restart db api` maupun `up -d --force-recreate`, tidak dapat diunduh melalui URL `web`, lalu dibersihkan sebelum `docker compose down` (tanpa `-v`).
 
 ---
 
-## 3. Pemeriksaan Persistensi Volume
+## 4. Ruang Lingkup Pengujian Issue Berikutnya
 
-Uji ketahanan data sementara (tanpa data nyata) pada `sbs_pgdata` dan `sbs_uploads`:
-1. Buat tabel penanda sementara pada `db` dan file penanda sementara di `/app/storage/revisions/` pada container `api`.
-2. Pastikan file penanda pada `/app/storage/revisions/` tidak dapat diakses melalui HTTP endpoint `web`.
-3. Restart `db` dan `api`, lalu lakukan recreate (`docker compose ... up -d --force-recreate`).
-4. Verifikasi tabel penanda di PostgreSQL dan file penanda di `api` masih ada dan dapat dibaca.
-5. Hapus tabel dan file penanda sementara, lalu hentikan stack smoke test dengan `docker compose ... down` (**jangan pernah menjalankan `down -v` pada data aktif**).
-
----
-
-## 4. Ruang Lingkup Pengujian Fitur Berikutnya
-
-Pengujian fitur bisnis (autentikasi, cookie `HttpOnly`, CSRF, RBAC, pengajuan/persetujuan judul, pembimbing, jadwal bimbingan, upload PDF/DOCX <= 10 MiB, catatan dosen *append-only*, serta monitoring progres) dijadwalkan pada Issue `SBS-19`, `SBS-05`–`SBS-13`.
+Pengujian fitur bisnis (schema/integritas database `SBS-19`, auth/JWT/CSRF/RBAC `SBS-05`–`SBS-06`, workflow akademik `SBS-07`–`SBS-11`, shared UI `SBS-12`, serta deployment domain online `SBS-13`–`SBS-15`) dilakukan pada masing-masing Issue.
 
 ---
 
 ## 5. Log Hasil Pengujian
 
-### Pengujian `SBS-04` (26 November 2026)
+### Final Verification Gate `SBS-04` (26 November 2026)
 
-- **Lingkungan:** Host pengembangan lokal & Docker Compose terisolasi (`-p sbs_smoke_sbs04`)
-- **Aplikasi (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`):**
-  - `npm run typecheck`: Lulus untuk `client` dan `server`.
-  - `npm run lint`: Lulus tanpa error/warning pada `client` dan `server`.
-  - `npm run build`: Bundle produksi `client/dist/` (`dist/index.html`, CSS, JS) dan kompilasi `server/dist/` berhasil.
-  - `npm test`: `6` pengujian pada `2` suite lulus (`loadEnv validation` 3/3, `Express API foundation` 3/3).
-  - Smoke dev (`npm run dev`): Frontend (`http://127.0.0.1:5173/`) dan proxy `/api/v1/health` ke Express (`0.0.0.0:3000`) merespons `200 OK`.
-- **Docker Compose & Persistensi (`config`, `build`, `up -d`, `ps`, `restart`, `up -d --force-recreate`, `down`):**
-  - `docker compose config --quiet` dan `docker compose build`: Lulus untuk `web` dan `api`.
-  - `docker compose ps`: `db`, `api`, dan `web` ketiganya berstatus `running (healthy)`.
-  - Endpoint HTTP via `web`: `GET /healthz` (`200 ok`), `GET /` (`200` HTML), `GET /api/v1/health` (`200` JSON `status: "ok"`), `GET /api/v1/unknown` (`404` `NOT_FOUND`).
-  - Isolasi & Runtime: `db` dan `api` tidak mempublikasikan port host (`host_published=[]`); `web` hanya terikat pada `127.0.0.1:8080->8080/tcp`; jaringan `internal` memiliki `Internal=true`; `api` berjalan sebagai `uid=1000(node)` dan `web` sebagai `uid=101(nginx)`; `.env` tidak ada di image; log bebas credential.
-  - Persistensi & Pembersihan: Data penanda sementara pada PostgreSQL (`sbs_pgdata`) dan direktori `/app/storage/revisions` (`sbs_uploads`) bertahan setelah `restart db api` dan `up -d --force-recreate`, tidak dapat diakses via path publik `web`, dan dibersihkan sebelum `docker compose down` (tanpa `-v`).
+- **Aplikasi (`npm ci --offline`, `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`):**
+  - `npm ci --offline`: Lulus (`285` packages tersinkron dengan root `package-lock.json`).
+  - `npm run typecheck`: Lulus untuk `sbs-client` dan `sbs-server`.
+  - `npm run lint`: Lulus tanpa error maupun warning pada `client` dan `server`.
+  - `npm run build`: `client/dist/` (Vite `545ms`) dan `server/dist/` (`tsc -p tsconfig.build.json`) berhasil.
+  - `npm test`: `10/10` tests pada `3` suite lulus (`loadEnv validation` 4/4, `Express API foundation` 3/3, `Error logging safeguards` 3/3).
+- **Development Workflow (`-p sbs04-dev-final`, `compose.yaml` + `compose.dev.yaml`):**
+  - `docker compose ... up -d db`: PostgreSQL 16 berstatus `healthy`, port hanya terikat ke `127.0.0.1:5432->5432/tcp`, wire protocol pada `127.0.0.1:5432` merespons normal.
+  - `npm run dev` (`API_HOST=127.0.0.1`): Express mendengarkan pada `127.0.0.1:3000` (bukan `0.0.0.0`), `http://127.0.0.1:5173/` (`200` HTML), `http://127.0.0.1:5173/api/v1/health` (`200` JSON `status: "ok"`), dihentikan bersih via `stop db`.
+- **Full Stack Compose (`-p sbs04-final`, `compose.yaml` saja):**
+  - `docker compose ... config --quiet` & `build` & `up -d`: Ketiga service (`db`, `api`, `web`) mencapai status `running (healthy)`.
+  - Endpoint via `web`: `GET /healthz` (`200 ok`), `GET /` (`200` HTML), `GET /api/v1/health` (`200` JSON `status: "ok"`).
+  - Isolasi & Runtime: `api` dan `db` `host_published=[]`, jaringan `internal` memiliki `Internal=true`, `api` memakai host DB `db:5432`, `api` berjalan sebagai `uid=1000(node)`, `web` berjalan sebagai `uid=101(nginx)` (`nginx version: nginx/1.30.6`), `nginx -t` lulus, `nginx -T` memuat `client_max_body_size 12m;` pada `location /api/`.
+  - Keamanan & Persistensi: `.env` absen di image, log bebas credential, `git diff --check` bersih, `rg` bebas penyebutan host privat dan `localStorage`/`sessionStorage`; penanda sementara DB & `/app/storage/revisions` tidak bocor via `web`, bertahan setelah `restart db api` dan `up -d --force-recreate`, lalu dibersihkan sebelum `down` (tanpa `-v`).
