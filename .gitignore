@@ -1,0 +1,49 @@
+# Node.js dependencies & logs
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+
+# Build output
+dist/
+build/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Local database & runtime private files
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+*.dump
+pgdata/
+uploads/
+storage/
+
+# IDE & OS temporary files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+*.log
+tmp/
+temp/

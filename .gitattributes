@@ -1,0 +1,46 @@
+# Default text normalization
+* text=auto eol=lf
+
+# Source code, config, and documentation (LF)
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.sql text eol=lf
+*.prisma text eol=lf
+*.sh text eol=lf
+.env.example text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+.gitattributes text eol=lf
+Dockerfile* text eol=lf
+
+# Windows scripts (CRLF)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.docx binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
