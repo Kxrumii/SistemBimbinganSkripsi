@@ -18,7 +18,18 @@ from typing import Iterable
 FORBIDDEN_SHELL_RE = re.compile(r"[;|&><`$(){}\\\n\r\0]")
 ENV_ASSIGN_LIKE_RE = re.compile(r"^([^=\s]+)=(.*)$")
 SAFE_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SAFE_SCHEMA_PATH_RE = re.compile(r"^(?:\./)?[A-Za-z0-9_./-]+\.prisma$")
+ZERO_SHA_RE = re.compile(r"^0+$")
+CANONICAL_SCHEMA_PATHS = frozenset({"prisma/schema.prisma"})
+PRISMA_CONFIG_CANDIDATES = (
+    "prisma.config.ts",
+    "prisma.config.js",
+    "prisma.config.mjs",
+    "prisma.config.cjs",
+    "server/prisma.config.ts",
+    "server/prisma.config.js",
+    "server/prisma.config.mjs",
+    "server/prisma.config.cjs",
+)
 SAFE_SEED_PATH_RE = re.compile(r"^(?:\./)?(?:prisma/)?seed\.[cm]?[jt]s$")
 SAFE_DB_TEST_PATH_RE = re.compile(
     r"^(?:\./)?src/__tests__/database(?:/|/(?:\*|[A-Za-z0-9_.-]+)\.test\.ts)?$"
@@ -45,7 +56,10 @@ def run_git(repo_root: str, args: list[str]) -> subprocess.CompletedProcess[str]
 
 
 def git_object_exists(repo_root: str, rev_spec: str) -> bool:
-    res = run_git(repo_root, ["cat-file", "-e", rev_spec])
+    try:
+        res = run_git(repo_root, ["cat-file", "-e", rev_spec])
+    except OSError as exc:
+        raise GitInspectionError("Failed to execute git cat-file while inspecting base commit.") from exc
     return res.returncode == 0
 
 
@@ -54,34 +68,57 @@ def git_blob_sha(data: bytes) -> str:
     return hashlib.sha1(header + data).hexdigest()
 
 
+def validate_commit_ref(repo_root: str, candidate: str, source_label: str) -> tuple[str | None, str | None]:
+    if not candidate:
+        return None, f"{source_label} is empty; cannot verify schema and migration immutability."
+    if ZERO_SHA_RE.match(candidate):
+        return None, f"{source_label} is an invalid zero commit SHA; cannot verify migration immutability."
+    try:
+        exists = git_object_exists(repo_root, f"{candidate}^{{commit}}")
+    except GitInspectionError as exc:
+        return None, str(exc)
+    if not exists:
+        return (
+            None,
+            f"Base commit {candidate} ({source_label}) is missing from git history; cannot verify schema and migration immutability.",
+        )
+    return candidate, None
+
+
 def resolve_base_ref(
     repo_root: str, event_name: str, base_sha: str | None
 ) -> tuple[str | None, str | None]:
     clean_base = (base_sha or "").strip()
     if event_name == "pull_request":
-        if not clean_base:
-            return None, "pull_request event is missing base commit SHA."
-        if not git_object_exists(repo_root, f"{clean_base}^{{commit}}"):
+        return validate_commit_ref(repo_root, clean_base, "pull_request base SHA")
+
+    if event_name == "push":
+        return validate_commit_ref(repo_root, clean_base, "push before SHA")
+
+    if event_name == "workflow_dispatch":
+        if clean_base:
+            return validate_commit_ref(repo_root, clean_base, "workflow_dispatch base SHA")
+        try:
+            parent = run_git(repo_root, ["rev-parse", "--verify", "HEAD^"])
+        except OSError:
+            return None, "Failed to execute git rev-parse HEAD^ during workflow_dispatch base resolution."
+        if parent.returncode != 0:
             return (
                 None,
-                f"Base commit {clean_base} is missing from git history; cannot verify schema and migration immutability.",
+                f"git rev-parse --verify HEAD^ failed during workflow_dispatch base resolution (exit code {parent.returncode}).",
             )
-        return clean_base, None
-
-    if clean_base and git_object_exists(repo_root, f"{clean_base}^{{commit}}"):
-        return clean_base, None
-
-    parent = run_git(repo_root, ["rev-parse", "--verify", "HEAD^"])
-    if parent.returncode == 0:
         resolved = parent.stdout.strip()
-        if resolved and git_object_exists(repo_root, f"{resolved}^{{commit}}"):
-            return resolved, None
-    return None, None
+        return validate_commit_ref(repo_root, resolved, "workflow_dispatch HEAD^")
+
+    return (
+        None,
+        f"Unsupported or missing GitHub event '{event_name}'; cannot safely resolve base commit for migration immutability.",
+    )
 
 
-def get_base_migrations(repo_root: str, base_ref: str | None) -> dict[str, str]:
-    if not base_ref:
-        return {}
+def get_base_migrations(repo_root: str, base_ref: str) -> dict[str, str]:
+    if not isinstance(base_ref, str) or not base_ref.strip():
+        raise GitInspectionError("Base commit ref is required for migration immutability inspection.")
     try:
         res = run_git(
             repo_root,
@@ -114,7 +151,7 @@ def get_base_migrations(repo_root: str, base_ref: str | None) -> dict[str, str]:
     return migrations
 
 
-def check_migration_immutability(repo_root: str, base_ref: str | None) -> list[str]:
+def check_migration_immutability(repo_root: str, base_ref: str) -> list[str]:
     try:
         base_migrations = get_base_migrations(repo_root, base_ref)
     except GitInspectionError as exc:
@@ -258,7 +295,7 @@ def describe_env_var_name(raw_name: str) -> str:
 
 
 def parse_single_direct_command(script_name: str, raw_cmd: object) -> tuple[str | None, list[str], str | None]:
-    """Parse one direct command with strict executable tokens and explicit env allowlist."""
+    """Parse one direct local executable command without wrappers, shell chaining, or unsafe env vars."""
     if not isinstance(raw_cmd, str) or not raw_cmd.strip():
         return None, [], f"server/package.json scripts.{script_name} is missing or empty"
 
@@ -328,58 +365,47 @@ def parse_single_direct_command(script_name: str, raw_cmd: object) -> tuple[str 
     if first_err:
         return None, [], first_err
 
-    if first == "npx":
-        rest = remaining[1:]
-        if rest and rest[0] == "--no-install":
-            rest = rest[1:]
-        if not rest:
-            return (
-                None,
-                [],
-                f"server/package.json scripts.{script_name} is missing target executable after npx",
-            )
-        target_err = validate_exact_executable_token(rest[0], script_name, role="npx target executable")
-        if target_err:
-            return None, [], target_err
-        return rest[0], rest[1:], None
-
-    if first == "npm":
-        if len(remaining) >= 4 and remaining[1] == "exec" and remaining[2] == "--":
-            sub_exe = remaining[3]
-            target_err = validate_exact_executable_token(sub_exe, script_name, role="npm exec target executable")
-            if target_err:
-                return None, [], target_err
-            return sub_exe, remaining[4:], None
+    if first in {"npx", "npm"}:
         return (
             None,
             [],
-            f"server/package.json scripts.{script_name} uses unsupported npm invocation; use a direct command or 'npm exec -- <cmd>'",
+            f"server/package.json scripts.{script_name} cannot invoke '{first}' wrapper; use the direct local executable from workspace dependencies",
         )
 
     return first, remaining[1:], None
 
 
-def consume_optional_prisma_schema_flag(args: list[str]) -> tuple[list[str], str | None]:
-    """Strip at most one valid --schema flag from prisma arguments."""
+def consume_canonical_prisma_schema_flag(args: list[str]) -> tuple[list[str], str | None]:
+    """Allow omitted --schema or exact canonical prisma/schema.prisma; reject alternates and --config."""
     out: list[str] = []
     seen_schema = False
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == "--config" or arg.startswith("--config="):
+            return [], "--config option is not permitted because it can redirect Prisma schema or migrations outside server/prisma/"
         if arg.startswith("--schema="):
             if seen_schema:
                 return [], "Duplicate --schema flag is not allowed"
             val = arg.split("=", 1)[1]
-            if not SAFE_SCHEMA_PATH_RE.match(val) or ".." in val.split("/"):
-                return [], f"Invalid --schema path: {val}"
+            if val not in CANONICAL_SCHEMA_PATHS:
+                return (
+                    [],
+                    f"Non-canonical --schema path is rejected (expected 'prisma/schema.prisma', got: {val!r})",
+                )
             seen_schema = True
             i += 1
         elif arg == "--schema":
-            if seen_schema or i + 1 >= len(args):
-                return [], "Invalid or duplicate --schema option"
+            if seen_schema:
+                return [], "Duplicate --schema flag is not allowed"
+            if i + 1 >= len(args):
+                return [], "Empty or missing value for --schema option"
             val = args[i + 1]
-            if not SAFE_SCHEMA_PATH_RE.match(val) or ".." in val.split("/"):
-                return [], f"Invalid --schema path: {val}"
+            if val not in CANONICAL_SCHEMA_PATHS:
+                return (
+                    [],
+                    f"Non-canonical --schema path is rejected (expected 'prisma/schema.prisma', got: {val!r})",
+                )
             seen_schema = True
             i += 2
         else:
@@ -391,7 +417,7 @@ def consume_optional_prisma_schema_flag(args: list[str]) -> tuple[list[str], str
 def validate_db_validate_script(exe: str, args: list[str]) -> str | None:
     if exe != "prisma":
         return "server/package.json scripts.db:validate must directly invoke exact executable 'prisma validate'"
-    core_args, err = consume_optional_prisma_schema_flag(args)
+    core_args, err = consume_canonical_prisma_schema_flag(args)
     if err:
         return f"server/package.json scripts.db:validate: {err}"
     if core_args != ["validate"]:
@@ -402,7 +428,7 @@ def validate_db_validate_script(exe: str, args: list[str]) -> str | None:
 def validate_db_migrate_deploy_script(exe: str, args: list[str]) -> str | None:
     if exe != "prisma":
         return "server/package.json scripts.db:migrate:deploy must directly invoke exact executable 'prisma migrate deploy'"
-    core_args, err = consume_optional_prisma_schema_flag(args)
+    core_args, err = consume_canonical_prisma_schema_flag(args)
     if err:
         return f"server/package.json scripts.db:migrate:deploy: {err}"
     if core_args != ["migrate", "deploy"]:
@@ -410,20 +436,9 @@ def validate_db_migrate_deploy_script(exe: str, args: list[str]) -> str | None:
     return None
 
 
-def validate_db_seed_script(exe: str, args: list[str]) -> str | None:
-    if exe == "prisma":
-        core_args, err = consume_optional_prisma_schema_flag(args)
-        if err:
-            return f"server/package.json scripts.db:seed: {err}"
-        if core_args == ["db", "seed"]:
-            return None
-        return "server/package.json scripts.db:seed using prisma must strictly run 'prisma db seed'"
-
+def validate_seed_runner_command(exe: str, args: list[str]) -> bool:
     if exe == "tsx":
-        if len(args) == 1 and SAFE_SEED_PATH_RE.match(args[0]):
-            return None
-        return "server/package.json scripts.db:seed using tsx must strictly target prisma/seed.ts or seed.ts"
-
+        return len(args) == 1 and bool(SAFE_SEED_PATH_RE.match(args[0]))
     if exe == "node":
         idx = 0
         if idx < len(args):
@@ -432,9 +447,23 @@ def validate_db_seed_script(exe: str, args: list[str]) -> str | None:
             elif args[idx] == "--import" and idx + 1 < len(args) and args[idx + 1] == "tsx":
                 idx += 2
         remaining = args[idx:]
-        if len(remaining) == 1 and SAFE_SEED_PATH_RE.match(remaining[0]):
+        return len(remaining) == 1 and bool(SAFE_SEED_PATH_RE.match(remaining[0]))
+    return False
+
+
+def validate_db_seed_script(exe: str, args: list[str]) -> str | None:
+    if exe == "prisma":
+        core_args, err = consume_canonical_prisma_schema_flag(args)
+        if err:
+            return f"server/package.json scripts.db:seed: {err}"
+        if core_args == ["db", "seed"]:
             return None
-        return "server/package.json scripts.db:seed using node must strictly target a seed file without extra commands or flags"
+        return "server/package.json scripts.db:seed using prisma must strictly run 'prisma db seed'"
+
+    if exe in {"tsx", "node"}:
+        if validate_seed_runner_command(exe, args):
+            return None
+        return f"server/package.json scripts.db:seed using {exe} must strictly target prisma/seed.ts or seed.ts without extra commands or flags"
 
     return "server/package.json scripts.db:seed must directly invoke exact executable 'prisma', 'tsx', or 'node'"
 
@@ -509,6 +538,55 @@ SCRIPT_VALIDATORS = {
 }
 
 
+def validate_prisma_config(repo_root: str) -> list[str]:
+    """Conservative guard preventing Prisma configuration from redirecting schema or migrations."""
+    errors: list[str] = []
+
+    for rel_path in PRISMA_CONFIG_CANDIDATES:
+        if os.path.exists(os.path.join(repo_root, rel_path)):
+            errors.append(
+                f"Prisma config file '{rel_path}' is not permitted because schema and migrations must use canonical server/prisma/ paths"
+            )
+
+    root_pkg_path = os.path.join(repo_root, "package.json")
+    if os.path.isfile(root_pkg_path):
+        with open(root_pkg_path, encoding="utf-8") as fh:
+            root_pkg = json.load(fh)
+        if "prisma" in root_pkg:
+            errors.append(
+                "Root package.json cannot define a 'prisma' configuration block; place canonical Prisma configuration in server/package.json"
+            )
+
+    server_pkg_path = os.path.join(repo_root, "server/package.json")
+    if os.path.isfile(server_pkg_path):
+        with open(server_pkg_path, encoding="utf-8") as fh:
+            server_pkg = json.load(fh)
+        if "prisma" in server_pkg:
+            prisma_cfg = server_pkg["prisma"]
+            if not isinstance(prisma_cfg, dict):
+                errors.append("server/package.json 'prisma' field must be an object")
+            else:
+                unknown_keys = sorted(set(prisma_cfg.keys()) - {"schema", "seed"})
+                if unknown_keys:
+                    errors.append(
+                        f"server/package.json 'prisma' contains unsupported key(s) {unknown_keys}; only 'schema' and 'seed' are allowed"
+                    )
+                if "schema" in prisma_cfg and prisma_cfg["schema"] not in CANONICAL_SCHEMA_PATHS:
+                    errors.append(
+                        f"server/package.json prisma.schema must equal 'prisma/schema.prisma' (got: {prisma_cfg['schema']!r})"
+                    )
+                if "seed" in prisma_cfg:
+                    exe, args, parse_err = parse_single_direct_command("prisma.seed", prisma_cfg["seed"])
+                    if parse_err:
+                        errors.append(parse_err)
+                    elif exe is None or not validate_seed_runner_command(exe, args):
+                        errors.append(
+                            "server/package.json prisma.seed must directly execute 'tsx' or 'node' targeting prisma/seed.ts without wrappers"
+                        )
+
+    return errors
+
+
 def validate_scripts(repo_root: str) -> list[str]:
     errors: list[str] = []
     pkg_path = os.path.join(repo_root, "server/package.json")
@@ -541,19 +619,24 @@ def write_github_output(path: str | None, key: str, value: str) -> None:
 def cmd_check_schema_and_contract(args: argparse.Namespace) -> int:
     repo_root = os.path.abspath(args.repo_root)
     base_ref, base_err = resolve_base_ref(repo_root, args.event_name, args.base_sha)
-    if base_err:
-        print(f"::error::{base_err}")
+    if base_err or not base_ref:
+        print(f"::error::{base_err or 'Unable to resolve base commit reference.'}")
+        write_github_output(args.github_output, "run_prisma", "false")
         return 1
 
-    base_has_schema = bool(
-        base_ref and git_object_exists(repo_root, f"{base_ref}:server/prisma/schema.prisma")
-    )
+    try:
+        base_has_schema = git_object_exists(repo_root, f"{base_ref}:server/prisma/schema.prisma")
+    except GitInspectionError as exc:
+        print(f"::error::{exc}")
+        write_github_output(args.github_output, "run_prisma", "false")
+        return 1
+
     schema_path = os.path.join(repo_root, "server/prisma/schema.prisma")
     pr_has_schema = os.path.isfile(schema_path)
 
     print(
         "Database schema detection: "
-        f"EVENT_NAME={args.event_name}, BASE_REF={base_ref or 'none'}, "
+        f"EVENT_NAME={args.event_name}, BASE_REF={base_ref}, "
         f"BASE_HAS_SCHEMA={str(base_has_schema).lower()}, PR_HAS_SCHEMA={str(pr_has_schema).lower()}"
     )
 
@@ -581,6 +664,7 @@ def cmd_check_schema_and_contract(args: argparse.Namespace) -> int:
 
     errors: list[str] = []
     errors.extend(immutability_errors)
+    errors.extend(validate_prisma_config(repo_root))
 
     with open(schema_path, encoding="utf-8") as fh:
         if not fh.read().strip():
@@ -610,7 +694,7 @@ def cmd_check_schema_and_contract(args: argparse.Namespace) -> int:
 
     print(
         f"Verified SBS-19 database contract: {mig_count} valid migration(s), "
-        f"{test_file_count} runnable database test file(s), migration immutability intact, and all scripts valid."
+        f"{test_file_count} runnable database test file(s), canonical paths and immutability intact."
     )
     write_github_output(args.github_output, "run_prisma", "true")
     return 0
@@ -689,7 +773,7 @@ def render_step_summary(
     run_prisma: str,
     prisma_outcome: str,
 ) -> str:
-    """Render honest GitHub Actions Step Summary table from actual step outcomes."""
+    """Render precise 5-row GitHub Actions Step Summary table separating self-tests from SBS-19 contract."""
     infra_outcomes = {pg_health_outcome, pg_connect_outcome}
     if infra_outcomes == {"success"}:
         infra_status = "PASS"
@@ -704,27 +788,36 @@ def render_step_summary(
         infra_status = "NOT COMPLETED"
         infra_note = f"PostgreSQL checks did not finish (health={pg_health_outcome}, connect={pg_connect_outcome})"
 
-    val_outcomes = {validator_tests_outcome, contract_outcome}
-    if val_outcomes == {"success"}:
-        val_status = "PASS"
-        val_note = "Validator self-tests and schema/script contract check passed"
-    elif "failure" in val_outcomes:
-        val_status = "FAIL"
-        val_note = f"Validator check failed (self-tests={validator_tests_outcome}, contract={contract_outcome})"
-    elif contract_outcome == "skipped" and validator_tests_outcome == "success":
-        val_status = "NOT COMPLETED"
-        val_note = "Contract check did not run after earlier step failure"
-    elif val_outcomes <= {"skipped", ""}:
-        val_status = "SKIPPED"
-        val_note = "Validator checks were skipped"
+    if validator_tests_outcome == "success":
+        self_test_status = "PASS"
+        self_test_note = "Validator regression tests passed"
+    elif validator_tests_outcome == "failure":
+        self_test_status = "FAIL"
+        self_test_note = "Validator self-tests failed"
+    elif validator_tests_outcome in {"skipped", ""}:
+        self_test_status = "SKIPPED"
+        self_test_note = "Validator self-tests were skipped"
     else:
-        val_status = "NOT COMPLETED"
-        val_note = f"Validator incomplete (self-tests={validator_tests_outcome}, contract={contract_outcome})"
+        self_test_status = "NOT COMPLETED"
+        self_test_note = f"Validator self-tests did not complete ({validator_tests_outcome})"
+
+    if contract_outcome == "success" and run_prisma == "false":
+        contract_status = "N/A"
+        contract_note = "Awaiting SBS-19 schema and database artifacts; baseline inspection completed"
+    elif contract_outcome == "success" and run_prisma == "true":
+        contract_status = "PASS"
+        contract_note = "Canonical schema, migration, and script contract validated"
+    elif contract_outcome == "failure":
+        contract_status = "FAIL"
+        contract_note = "Schema, migration immutability, base ref, or script contract check failed"
+    else:
+        contract_status = "NOT COMPLETED"
+        contract_note = f"Contract inspection did not complete (outcome={contract_outcome}, run_prisma={run_prisma or 'unset'})"
 
     if contract_outcome == "success" and run_prisma == "false":
         prisma_status = "N/A"
-        prisma_note = "Awaiting SBS-19 schema and database artifacts"
-    elif run_prisma == "true" and prisma_outcome == "success":
+        prisma_note = "Application schema is not available yet"
+    elif contract_outcome == "success" and run_prisma == "true" and prisma_outcome == "success":
         prisma_status = "PASS"
         prisma_note = "Validate, migration deploy, seed, and database tests passed"
     elif prisma_outcome == "failure":
@@ -732,12 +825,22 @@ def render_step_summary(
         prisma_note = "Prisma validate, migration deploy, seed, or database tests failed"
     else:
         prisma_status = "NOT COMPLETED"
-        prisma_note = f"Did not complete (contract={contract_outcome}, prisma={prisma_outcome})"
+        prisma_note = f"Prisma application suite did not complete (contract={contract_outcome}, prisma={prisma_outcome})"
 
-    if infra_status == "PASS" and val_status == "PASS" and prisma_status == "N/A":
+    if (
+        infra_status == "PASS"
+        and self_test_status == "PASS"
+        and contract_status == "N/A"
+        and prisma_status == "N/A"
+    ):
         overall_status = "SUCCESS"
-        overall_note = "All applicable baseline checks passed (application Prisma suite N/A before SBS-19)"
-    elif infra_status == "PASS" and val_status == "PASS" and prisma_status == "PASS":
+        overall_note = "All applicable baseline checks passed"
+    elif (
+        infra_status == "PASS"
+        and self_test_status == "PASS"
+        and contract_status == "PASS"
+        and prisma_status == "PASS"
+    ):
         overall_status = "SUCCESS"
         overall_note = "All applicable database integration checks passed"
     else:
@@ -750,7 +853,8 @@ def render_step_summary(
         "| Area | Status | Keterangan |",
         "|---|---|---|",
         f"| PostgreSQL infrastructure | {infra_status} | {infra_note} |",
-        f"| Database contract validator | {val_status} | {val_note} |",
+        f"| CI validator self-tests | {self_test_status} | {self_test_note} |",
+        f"| SBS-19 schema/script/migration contract | {contract_status} | {contract_note} |",
         f"| Prisma application integration | {prisma_status} | {prisma_note} |",
         f"| Overall Database Integration | {overall_status} | {overall_note} |",
         "",

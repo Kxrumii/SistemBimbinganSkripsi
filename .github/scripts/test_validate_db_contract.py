@@ -62,7 +62,11 @@ class TempRepoTestCase(unittest.TestCase):
         self._git(["commit", "-q", "-m", msg])
         return self._git(["rev-parse", "HEAD"])
 
-    def write_valid_sbs19_contract(self, overrides: dict[str, str] | None = None) -> None:
+    def write_valid_sbs19_contract(
+        self,
+        overrides: dict[str, str] | None = None,
+        prisma_cfg: object | None = None,
+    ) -> None:
         self.write_file("server/prisma/schema.prisma", 'datasource db {\n  provider = "postgresql"\n}\n')
         self.write_file(
             "server/prisma/migrations/migration_lock.toml",
@@ -81,7 +85,10 @@ class TempRepoTestCase(unittest.TestCase):
         scripts = dict(VALID_SCRIPTS)
         if overrides:
             scripts.update(overrides)
-        self.write_file("server/package.json", json.dumps({"scripts": scripts}, indent=2))
+        pkg_obj: dict[str, object] = {"scripts": scripts}
+        if prisma_cfg is not None:
+            pkg_obj["prisma"] = prisma_cfg
+        self.write_file("server/package.json", json.dumps(pkg_obj, indent=2))
 
     def run_check(
         self, event_name: str = "pull_request", base_sha: str | None = None
@@ -117,14 +124,16 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
         self.assertIn("run_prisma=false", gh_out)
         self.assertIn("N/A", logs)
 
-    def test_accepts_valid_direct_commands_without_chaining(self) -> None:
+    def test_accepts_valid_direct_commands_and_canonical_schema(self) -> None:
         valid_variants = [
             {"db:validate": "prisma validate"},
-            {"db:validate": "npx prisma validate"},
-            {"db:validate": "npx --no-install prisma validate --schema=prisma/schema.prisma"},
+            {"db:validate": "prisma validate --schema=prisma/schema.prisma"},
+            {"db:validate": "prisma validate --schema prisma/schema.prisma"},
             {"db:migrate:deploy": "prisma migrate deploy"},
-            {"db:migrate:deploy": "npm exec -- prisma migrate deploy"},
+            {"db:migrate:deploy": "prisma migrate deploy --schema=prisma/schema.prisma"},
+            {"db:migrate:deploy": "prisma migrate deploy --schema prisma/schema.prisma"},
             {"db:seed": "prisma db seed"},
+            {"db:seed": "prisma db seed --schema=prisma/schema.prisma"},
             {"db:seed": "tsx prisma/seed.ts"},
             {"db:seed": "node --import tsx prisma/seed.ts"},
             {"test:db": "node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"},
@@ -139,6 +148,85 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             self.assertEqual(code, 0, msg=f"Failed for valid script override: {override}")
             self.assertIn("run_prisma=true", gh_out)
 
+    def test_rejects_alternate_schema_paths_traversal_and_config_redirection(self) -> None:
+        bad_schema_cmds = [
+            ("db:validate", "prisma validate --schema=alternate/schema.prisma"),
+            ("db:validate", "prisma validate --schema alternate/schema.prisma"),
+            ("db:validate", "prisma validate --schema=/tmp/schema.prisma"),
+            ("db:validate", "prisma validate --schema=../other/schema.prisma"),
+            ("db:validate", "prisma validate --schema=prisma/../alternate/schema.prisma"),
+            ("db:validate", "prisma validate --schema="),
+            ("db:validate", 'prisma validate --schema ""'),
+            ("db:validate", "prisma validate --schema"),
+            ("db:validate", "prisma validate --schema=prisma/schema.prisma --schema=prisma/schema.prisma"),
+            ("db:validate", "prisma validate --config=prisma.config.ts"),
+            ("db:validate", "prisma validate --config prisma.config.ts"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=alternate/schema.prisma"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=/tmp/schema.prisma"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=../other/schema.prisma"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=prisma/../alternate/schema.prisma"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema="),
+            ("db:migrate:deploy", "prisma migrate deploy --schema"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=prisma/schema.prisma --schema=prisma/schema.prisma"),
+            ("db:migrate:deploy", "prisma migrate deploy --config=prisma.config.ts"),
+        ]
+        for key, bad_cmd in bad_schema_cmds:
+            self.write_valid_sbs19_contract(overrides={key: bad_cmd})
+            code, _, _ = self.run_check()
+            self.assertEqual(
+                code,
+                1,
+                msg=f"Regression: non-canonical schema or config flag accepted for {key}: {bad_cmd!r}",
+            )
+
+        for cfg_rel in ("server/prisma.config.ts", "server/prisma.config.mjs", "prisma.config.ts"):
+            self.write_valid_sbs19_contract()
+            self.write_file(cfg_rel, "export default { schema: 'alternate/schema.prisma' };\n")
+            code, _, logs = self.run_check()
+            self.assertEqual(code, 1, msg=f"Expected rejection when {cfg_rel} exists")
+            self.assertIn("not permitted", logs)
+            os.remove(self.root / cfg_rel)
+
+        self.write_valid_sbs19_contract(prisma_cfg={"schema": "prisma/schema.prisma", "seed": "tsx prisma/seed.ts"})
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 0)
+
+        for bad_prisma_cfg in (
+            {"schema": "alternate/schema.prisma"},
+            {"migrations": "alternate/migrations"},
+            {"schema": "prisma/schema.prisma", "seed": "npx tsx prisma/seed.ts"},
+        ):
+            self.write_valid_sbs19_contract(prisma_cfg=bad_prisma_cfg)
+            code, _, _ = self.run_check()
+            self.assertEqual(code, 1, msg=f"Expected rejection for server/package.json prisma={bad_prisma_cfg!r}")
+
+    def test_rejects_npx_and_npm_exec_wrappers_across_all_four_scripts(self) -> None:
+        wrapper_cmds = [
+            ("db:validate", "npx prisma validate"),
+            ("db:validate", "npx --no-install prisma validate"),
+            ("db:validate", "npm exec -- prisma validate"),
+            ("db:migrate:deploy", "npx prisma migrate deploy"),
+            ("db:migrate:deploy", "npm exec -- prisma migrate deploy"),
+            ("db:seed", "npx tsx prisma/seed.ts"),
+            ("db:seed", "npm exec -- tsx prisma/seed.ts"),
+            ("test:db", "npx tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
+            ("test:db", "npm exec -- node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
+            ("db:validate", "npx ./ci-bin/prisma validate"),
+            ("db:validate", "npm exec -- ./ci-bin/prisma validate"),
+        ]
+        for key, bad_cmd in wrapper_cmds:
+            self.write_valid_sbs19_contract(overrides={key: bad_cmd})
+            code, _, logs = self.run_check()
+            self.assertEqual(
+                code,
+                1,
+                msg=f"Regression: wrapper command accepted for {key}: {bad_cmd!r}",
+            )
+            self.assertTrue(
+                "cannot invoke" in logs or "path-qualified" in logs,
+                msg=f"Unexpected error message for wrapper {bad_cmd!r}: {logs}",
+            )
+
     def test_rejects_path_qualified_executables_and_prefixes(self) -> None:
         bad_executables = [
             ("db:validate", "./ci-bin/prisma validate"),
@@ -149,11 +237,6 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             ("test:db", "./ci-bin/node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
             ("db:validate", "./ci-bin/npx prisma validate"),
             ("db:validate", "./ci-bin/npm exec -- prisma validate"),
-            ("db:validate", "npx ./ci-bin/prisma validate"),
-            ("db:validate", "npm exec -- ./ci-bin/prisma validate"),
-            ("db:migrate:deploy", "npx /tmp/prisma migrate deploy"),
-            ("db:seed", "npm exec -- ./ci-bin/tsx prisma/seed.ts"),
-            ("test:db", "npx ./ci-bin/tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
         ]
         for key, bad_cmd in bad_executables:
             self.write_valid_sbs19_contract(overrides={key: bad_cmd})
@@ -355,8 +438,68 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
         self.assertIn("cannot be deleted or renamed", logs)
 
 
-class MigrationInspectionFailClosedTests(TempRepoTestCase):
-    def test_get_base_migrations_reads_valid_entries(self) -> None:
+class BaseResolutionAndMigrationFailClosedTests(TempRepoTestCase):
+    def test_pull_request_base_ref_resolution_valid_empty_and_missing(self) -> None:
+        ref, err = v.resolve_base_ref(str(self.root), "pull_request", self.base_sha)
+        self.assertEqual(ref, self.base_sha)
+        self.assertIsNone(err)
+
+        ref, err = v.resolve_base_ref(str(self.root), "pull_request", "")
+        self.assertIsNone(ref)
+        self.assertIsNotNone(err)
+
+        ref, err = v.resolve_base_ref(str(self.root), "pull_request", "deadbeefdeadbeef")
+        self.assertIsNone(ref)
+        self.assertIsNotNone(err)
+
+    def test_push_event_uses_before_sha_and_fails_without_valid_base(self) -> None:
+        ref, err = v.resolve_base_ref(str(self.root), "push", self.base_sha)
+        self.assertEqual(ref, self.base_sha)
+        self.assertIsNone(err)
+
+        for bad_before in ("", "0" * 40, "not-a-sha"):
+            ref, err = v.resolve_base_ref(str(self.root), "push", bad_before)
+            self.assertIsNone(ref)
+            self.assertIsNotNone(err)
+            code, _, _ = self.run_check(event_name="push", base_sha=bad_before)
+            self.assertEqual(code, 1)
+
+    def test_workflow_dispatch_resolves_parent_and_fails_closed_when_unavailable(self) -> None:
+        # On root commit (no HEAD^), workflow_dispatch must fail closed
+        ref, err = v.resolve_base_ref(str(self.root), "workflow_dispatch", "")
+        self.assertIsNone(ref)
+        self.assertIsNotNone(err)
+        code, _, _ = self.run_check(event_name="workflow_dispatch", base_sha="")
+        self.assertEqual(code, 1)
+
+        # After a second commit, workflow_dispatch resolves parent HEAD^
+        self.write_file("README.md", "# Updated repo\n")
+        self.commit_all("second commit")
+        ref, err = v.resolve_base_ref(str(self.root), "workflow_dispatch", "")
+        self.assertEqual(ref, self.base_sha)
+        self.assertIsNone(err)
+        code, _, _ = self.run_check(event_name="workflow_dispatch", base_sha="")
+        self.assertEqual(code, 0)
+
+        # Mocked git rev-parse failure fails closed
+        real_run_git = v.run_git
+
+        def fake_rev_parse(repo_root: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+            if args and args[0] == "rev-parse":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=128,
+                    stdout="",
+                    stderr="fatal: rev-parse failed",
+                )
+            return real_run_git(repo_root, args)
+
+        with mock.patch.object(v, "run_git", side_effect=fake_rev_parse):
+            ref, err = v.resolve_base_ref(str(self.root), "workflow_dispatch", "")
+            self.assertIsNone(ref)
+            self.assertIsNotNone(err)
+
+    def test_get_base_migrations_reads_valid_entries_empty_and_rejects_failures(self) -> None:
         fake_stdout = (
             "100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tserver/prisma/migrations/migration_lock.toml\n"
             "100644 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tserver/prisma/migrations/20261126000000_init/migration.sql\n"
@@ -376,17 +519,13 @@ class MigrationInspectionFailClosedTests(TempRepoTestCase):
             },
         )
 
-    def test_get_base_migrations_returns_empty_dict_when_base_has_no_migrations(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["git", "ls-tree"],
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-        with mock.patch.object(v, "run_git", return_value=completed):
+        empty_ok = subprocess.CompletedProcess(args=["git", "ls-tree"], returncode=0, stdout="", stderr="")
+        with mock.patch.object(v, "run_git", return_value=empty_ok):
             self.assertEqual(v.get_base_migrations(str(self.root), "deadbeef"), {})
 
-    def test_get_base_migrations_fails_closed_when_git_ls_tree_fails(self) -> None:
+        with self.assertRaises(v.GitInspectionError):
+            v.get_base_migrations(str(self.root), "")
+
         failed = subprocess.CompletedProcess(
             args=["git", "ls-tree"],
             returncode=128,
@@ -396,9 +535,6 @@ class MigrationInspectionFailClosedTests(TempRepoTestCase):
         with mock.patch.object(v, "run_git", return_value=failed):
             with self.assertRaises(v.GitInspectionError):
                 v.get_base_migrations(str(self.root), "deadbeef")
-            errors = v.check_migration_immutability(str(self.root), "deadbeef")
-            self.assertTrue(errors)
-            self.assertIn("git ls-tree failed", errors[0])
 
     def test_check_schema_and_contract_fails_when_ls_tree_fails_even_without_schema(self) -> None:
         base_sha = self.base_sha
@@ -471,7 +607,7 @@ class TapVerificationTests(unittest.TestCase):
 
 
 class StepSummaryTests(unittest.TestCase):
-    def test_renders_baseline_na_summary_honestly(self) -> None:
+    def test_renders_baseline_na_summary_precisely(self) -> None:
         md = v.render_step_summary(
             validator_tests_outcome="success",
             pg_health_outcome="success",
@@ -481,12 +617,13 @@ class StepSummaryTests(unittest.TestCase):
             prisma_outcome="skipped",
         )
         self.assertIn("| PostgreSQL infrastructure | PASS |", md)
-        self.assertIn("| Database contract validator | PASS |", md)
+        self.assertIn("| CI validator self-tests | PASS |", md)
+        self.assertIn("| SBS-19 schema/script/migration contract | N/A |", md)
         self.assertIn("| Prisma application integration | N/A |", md)
         self.assertIn("| Overall Database Integration | SUCCESS |", md)
 
-    def test_renders_full_sbs19_pass_and_failure_states(self) -> None:
-        full_ok = v.render_step_summary(
+    def test_renders_full_sbs19_pass(self) -> None:
+        md = v.render_step_summary(
             validator_tests_outcome="success",
             pg_health_outcome="success",
             pg_connect_outcome="success",
@@ -494,31 +631,74 @@ class StepSummaryTests(unittest.TestCase):
             run_prisma="true",
             prisma_outcome="success",
         )
-        self.assertIn("| Prisma application integration | PASS |", full_ok)
-        self.assertIn("| Overall Database Integration | SUCCESS |", full_ok)
+        self.assertIn("| PostgreSQL infrastructure | PASS |", md)
+        self.assertIn("| CI validator self-tests | PASS |", md)
+        self.assertIn("| SBS-19 schema/script/migration contract | PASS |", md)
+        self.assertIn("| Prisma application integration | PASS |", md)
+        self.assertIn("| Overall Database Integration | SUCCESS |", md)
 
-        pg_fail = v.render_step_summary(
-            validator_tests_outcome="success",
-            pg_health_outcome="failure",
-            pg_connect_outcome="skipped",
-            contract_outcome="skipped",
-            run_prisma="",
-            prisma_outcome="skipped",
-        )
-        self.assertIn("| PostgreSQL infrastructure | FAIL |", pg_fail)
-        self.assertIn("| Prisma application integration | NOT COMPLETED |", pg_fail)
-        self.assertIn("| Overall Database Integration | FAILURE |", pg_fail)
-
-        prisma_fail = v.render_step_summary(
-            validator_tests_outcome="success",
-            pg_health_outcome="success",
-            pg_connect_outcome="success",
-            contract_outcome="success",
-            run_prisma="true",
-            prisma_outcome="failure",
-        )
-        self.assertIn("| Prisma application integration | FAIL |", prisma_fail)
-        self.assertIn("| Overall Database Integration | FAILURE |", prisma_fail)
+    def test_renders_failure_when_any_check_fails_or_is_incomplete(self) -> None:
+        cases = [
+            dict(
+                validator_tests_outcome="success",
+                pg_health_outcome="failure",
+                pg_connect_outcome="skipped",
+                contract_outcome="skipped",
+                run_prisma="",
+                prisma_outcome="skipped",
+                expected=("| PostgreSQL infrastructure | FAIL |", "| Overall Database Integration | FAILURE |"),
+            ),
+            dict(
+                validator_tests_outcome="failure",
+                pg_health_outcome="skipped",
+                pg_connect_outcome="skipped",
+                contract_outcome="skipped",
+                run_prisma="",
+                prisma_outcome="skipped",
+                expected=("| CI validator self-tests | FAIL |", "| Overall Database Integration | FAILURE |"),
+            ),
+            dict(
+                validator_tests_outcome="success",
+                pg_health_outcome="success",
+                pg_connect_outcome="success",
+                contract_outcome="failure",
+                run_prisma="false",
+                prisma_outcome="skipped",
+                expected=("| SBS-19 schema/script/migration contract | FAIL |", "| Prisma application integration | NOT COMPLETED |", "| Overall Database Integration | FAILURE |"),
+            ),
+            dict(
+                validator_tests_outcome="success",
+                pg_health_outcome="success",
+                pg_connect_outcome="success",
+                contract_outcome="success",
+                run_prisma="true",
+                prisma_outcome="failure",
+                expected=("| Prisma application integration | FAIL |", "| Overall Database Integration | FAILURE |"),
+            ),
+            dict(
+                validator_tests_outcome="success",
+                pg_health_outcome="success",
+                pg_connect_outcome="success",
+                contract_outcome="skipped",
+                run_prisma="",
+                prisma_outcome="skipped",
+                expected=("| SBS-19 schema/script/migration contract | NOT COMPLETED |", "| Overall Database Integration | FAILURE |"),
+            ),
+            dict(
+                validator_tests_outcome="success",
+                pg_health_outcome="success",
+                pg_connect_outcome="success",
+                contract_outcome="success",
+                run_prisma="true",
+                prisma_outcome="skipped",
+                expected=("| Prisma application integration | NOT COMPLETED |", "| Overall Database Integration | FAILURE |"),
+            ),
+        ]
+        for case in cases:
+            expected = case.pop("expected")
+            md = v.render_step_summary(**case)
+            for snippet in expected:
+                self.assertIn(snippet, md, msg=f"Missing {snippet!r} in:\n{md}")
 
 
 if __name__ == "__main__":

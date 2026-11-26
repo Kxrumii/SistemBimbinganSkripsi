@@ -17,22 +17,22 @@ Direktori ini disiapkan sebagai lokasi dokumentasi rancangan ERD dan artefak pen
 
 ## Kontrak Integrasi GitHub Actions CI (`Database Integration`)
 
-Job `Database Integration` pada [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) menyediakan instance PostgreSQL 16 Mode A (`compose.yaml` + `compose.dev.yaml`) pada `127.0.0.1:5432` dengan `DATABASE_URL` sementara pada setiap Pull Request dan push ke `main`. Sebelum `server/prisma/schema.prisma` tersedia (`SBS-19` belum di-merge), CI tetap menjalankan self-test validator kontrak dan memverifikasi kesiapan PostgreSQL, sementara Step Summary memisahkan infrastruktur PostgreSQL (`PASS`), validator (`PASS`), dan integrasi Prisma aplikasi (`N/A`).
+Job `Database Integration` pada [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) menyediakan instance PostgreSQL 16 Mode A (`compose.yaml` + `compose.dev.yaml`) pada `127.0.0.1:5432` dengan `DATABASE_URL` sementara pada setiap Pull Request dan push ke `main`. Sebelum `server/prisma/schema.prisma` tersedia (`SBS-19` belum di-merge), CI menjalankan self-test validator kontrak dan memverifikasi kesiapan PostgreSQL (`PASS`), sementara Step Summary melaporkan `SBS-19 schema/script/migration contract` serta `Prisma application integration` sebagai `N/A`.
 
 Saat **`SBS-19`** (serta Pull Request setelahnya) menambahkan schema Prisma, repository wajib menyediakan kontrak berikut pada workspace `server/`:
-- **Artefak wajib:**
-  - `server/prisma/schema.prisma` (non-empty)
+- **Lokasi kanonis & larangan pengalihan konfigurasi:**
+  - `server/prisma/schema.prisma` (non-empty); opsi `--schema` pada script hanya boleh dihilangkan atau tepat `prisma/schema.prisma`. Path alternatif, `--config`, file `prisma.config.*`, maupun key `package.json#prisma` yang mengalihkan `schema`/`migrations` di luar `server/prisma/` ditolak.
   - `server/prisma/migrations/migration_lock.toml` dengan `provider = "postgresql"`
   - Minimal satu `server/prisma/migrations/<nama_migrasi>/migration.sql` yang valid, non-empty, dan berisi SQL executable (bukan komentar atau `;` saja)
   - `server/prisma/seed.ts` (non-empty)
   - Direktori test khusus database `server/src/__tests__/database/*.test.ts` berisi minimal satu file test non-empty yang benar-benar dapat dijalankan
-- **Script wajib pada `server/package.json` (harus satu direct command *fail-closed* memakai exact executable token tanpa path `/` atau `\`, tanpa env prefix seperti `PATH=`/`NODE_PATH=`/`NODE_OPTIONS=`/`HOME=`/`IFS=`, dan tanpa `;`, `||`, `|`, `&&`, `&`, redirection, `$()`, backtick, placeholder, maupun unit test generik; hanya `NODE_ENV=test` yang diizinkan khusus pada `test:db`):**
+- **Script wajib pada `server/package.json` (harus satu direct local executable *fail-closed* dari dependency workspace tanpa wrapper `npx`/`npm exec`, tanpa path `/` atau `\`, tanpa env prefix seperti `PATH=`/`NODE_PATH=`/`NODE_OPTIONS=`/`HOME=`/`IFS=`, dan tanpa `;`, `||`, `|`, `&&`, `&`, redirection, `$()`, backtick, placeholder, maupun unit test generik; hanya `NODE_ENV=test` yang diizinkan khusus pada `test:db`):**
   1. `db:validate` — menjalankan `prisma validate`
   2. `db:migrate:deploy` — menjalankan `prisma migrate deploy`
-  3. `db:seed` — menjalankan seed sintetis (`prisma db seed` atau runner JS/TS ke `prisma/seed.ts`)
+  3. `db:seed` — menjalankan seed sintetis (`prisma db seed`, `tsx prisma/seed.ts`, atau `node --import tsx prisma/seed.ts`)
   4. `test:db` — menjalankan database test directory memakai runner test bawaan dengan output TAP, misalnya:
      `node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts`
 - **Ketentuan immutability & batas verifikasi test:**
-  - Migration SQL yang sudah ada pada base branch (`main`) bersifat immutable (tidak boleh dihapus, diubah, atau diganti nama pada Pull Request berikutnya), dan kegagalan inspeksi `git ls-tree` akan langsung menggagalkan CI (*fail-closed*). Penambahan migrasi baru dilakukan melalui direktori migrasi baru.
+  - Migration SQL yang sudah ada pada base branch (`main`) bersifat immutable (tidak boleh dihapus, diubah, atau diganti nama pada Pull Request berikutnya), dan kegagalan resolusi base commit atau `git ls-tree` akan langsung menggagalkan CI (*fail-closed*). Penambahan migrasi baru dilakukan melalui direktori migrasi baru.
   - Setelah `server/prisma/schema.prisma` tersedia di `main`, Pull Request yang menghapus file tersebut otomatis digagalkan.
   - Output TAP dari `test:db` diperiksa oleh CI untuk memastikan minimal satu test berjalan dan lulus (`# tests > 0`, `# pass > 0`, `# fail == 0`, serta tidak seluruh test berstatus skip). Karena CI tidak memverifikasi isi AST setiap test apakah benar-benar memanggil Prisma/PostgreSQL, reviewer pada `SBS-19` wajib meninjau bahwa test menjalankan operasi database nyata, bukan mock-only atau assertion statis. Detail lengkap dijelaskan pada [`docs/ci.md`](../docs/ci.md).
