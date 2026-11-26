@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run CI database contract validator self-tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
       - name: Typecheck workspaces
         run: npm run typecheck
 
@@ -69,6 +72,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Run CI database contract validator self-tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
       - name: Prepare ephemeral DB CI environment file
         run: |
@@ -167,82 +173,28 @@ jobs:
             echo "Container pg_isready and psql SELECT 1 succeeded (host psql client unavailable)."
           fi
 
-      - name: Check Prisma schema presence and run database integration suite
+      - name: Validate Prisma schema, migrations, and script contract
+        id: db_contract
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          BASE_HAS_SCHEMA=false
-          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${BASE_SHA}" ]; then
-            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-              echo "::error::Base commit ${BASE_SHA} is missing from git history; cannot verify Prisma schema presence."
-              exit 1
-            fi
-            if git cat-file -e "${BASE_SHA}:server/prisma/schema.prisma" 2>/dev/null; then
-              BASE_HAS_SCHEMA=true
-            fi
-          fi
+          python3 .github/scripts/validate_db_contract.py check-schema-and-contract \
+            --repo-root . \
+            --event-name "${EVENT_NAME}" \
+            --base-sha "${BASE_SHA}" \
+            --github-output "${GITHUB_OUTPUT}"
 
-          PR_HAS_SCHEMA=false
-          if [ -f "server/prisma/schema.prisma" ]; then
-            PR_HAS_SCHEMA=true
-          fi
-
-          echo "Database schema detection: EVENT_NAME=${EVENT_NAME}, BASE_HAS_SCHEMA=${BASE_HAS_SCHEMA}, PR_HAS_SCHEMA=${PR_HAS_SCHEMA}"
-
-          if [ "${BASE_HAS_SCHEMA}" = "true" ] && [ "${PR_HAS_SCHEMA}" = "false" ]; then
-            echo "::error::server/prisma/schema.prisma exists on base branch (${BASE_SHA}) and cannot be deleted to bypass Database Integration checks."
-            exit 1
-          fi
-
-          if [ "${PR_HAS_SCHEMA}" = "false" ]; then
-            echo "server/prisma/schema.prisma is not present on base or head yet; Prisma validate, migrate deploy, seed, and test:db are skipped (N/A) until SBS-19 lands."
-            exit 0
-          fi
-
-          python3 - <<'PY'
-          import glob, json, os, re
-
-          errors = []
-
-          schema_path = "server/prisma/schema.prisma"
-          if not os.path.isfile(schema_path) or os.path.getsize(schema_path) == 0:
-              errors.append("server/prisma/schema.prisma must exist and be non-empty")
-
-          migrations = glob.glob("server/prisma/migrations/**/migration.sql", recursive=True)
-          if not migrations:
-              errors.append("server/prisma/migrations/ must contain at least one migration.sql file")
-
-          seed_path = "server/prisma/seed.ts"
-          if not os.path.isfile(seed_path) or os.path.getsize(seed_path) == 0:
-              errors.append("server/prisma/seed.ts must exist and be non-empty")
-
-          pkg_path = "server/package.json"
-          if not os.path.isfile(pkg_path):
-              errors.append("server/package.json must exist")
-          else:
-              with open(pkg_path, encoding="utf-8") as fh:
-                  scripts = json.load(fh).get("scripts") or {}
-              placeholder_re = re.compile(r"^\s*(?:true|:|exit\s+0|echo\b.*)\s*$", re.IGNORECASE)
-              for script_name in ("db:validate", "db:migrate:deploy", "db:seed", "test:db"):
-                  cmd = scripts.get(script_name)
-                  if not isinstance(cmd, str) or not cmd.strip():
-                      errors.append(f"server/package.json scripts.{script_name} is missing or empty")
-                  elif placeholder_re.match(cmd):
-                      errors.append(f"server/package.json scripts.{script_name} cannot be a placeholder no-op ({cmd!r})")
-
-          if errors:
-              for err in errors:
-                  print(f"::error::{err}")
-              raise SystemExit(1)
-
-          print(f"Verified SBS-19 Prisma artifacts and server scripts ({len(migrations)} migration file(s) found).")
-          PY
-
+      - name: Run Prisma validation, migration deploy, seed, and database tests
+        if: steps.db_contract.outputs.run_prisma == 'true'
+        run: |
+          set -o pipefail
           npm run db:validate --workspace=server
           npm run db:migrate:deploy --workspace=server
           npm run db:seed --workspace=server
-          npm run test:db --workspace=server
+          TAP_FILE="${RUNNER_TEMP}/sbs-db-tests.tap"
+          npm run test:db --workspace=server | tee "${TAP_FILE}"
+          python3 .github/scripts/validate_db_contract.py verify-tap --tap-file "${TAP_FILE}"
 
       - name: Collect safe diagnostics on failure
         if: failure()
@@ -258,6 +210,7 @@ jobs:
       - name: Stop isolated PostgreSQL service and remove temporary env file
         if: always()
         run: |
+          rm -f "${RUNNER_TEMP}/sbs-db-tests.tap"
           ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-db-ci.env}"
           if [ -f "${ENV_TARGET}" ]; then
             docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \

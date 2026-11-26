@@ -5,7 +5,7 @@ Aplikasi web pengajuan judul dan pemantauan proses bimbingan skripsi untuk Tugas
 - **Repository:** https://github.com/Kxrumii/SistemBimbinganSkripsi
 - **Domain target:** `https://sbs.kxrumii.my.id` *(deployment produksi dijadwalkan pada `SBS-14`)*
 
-> **Status Repository:** Fondasi aplikasi (`client/`, `server/`) dan orkestrasi container Docker Compose (`compose.yaml`, `compose.dev.yaml`) tersedia pada branch kerja `SBS-04`. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
+> **Status Repository:** Fondasi aplikasi (`client/`, `server/`), orkestrasi container Docker Compose (`compose.yaml`, `compose.dev.yaml`), serta pipeline GitHub Actions CI (`.github/workflows/ci.yml`) sudah tersedia di repository. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
 
 ---
 
@@ -44,9 +44,12 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 ```text
 SistemBimbinganSkripsi/
 ├── .github/
-│   ├── pull_request_template.md   # Template Pull Request
+│   ├── pull_request_template.md       # Template Pull Request
+│   ├── scripts/
+│   │   ├── validate_db_contract.py    # Validator kontrak SBS-19 & output TAP
+│   │   └── test_validate_db_contract.py
 │   └── workflows/
-│       └── ci.yml                 # GitHub Actions CI (Quality Gate & Docker Compose Integration)
+│       └── ci.yml                     # GitHub Actions CI (3 job checks)
 ├── .gitattributes                 # Normalisasi line ending dan aturan file biner
 ├── .gitignore                     # Pengecualian node_modules, dist, .env, dan storage
 ├── .dockerignore                  # Pengecualian artefak lokal pada build context Docker
@@ -122,7 +125,7 @@ git fetch origin
 git switch --track origin/issue/4-app-foundation-docker
 ```
 
-Untuk anggota yang mengerjakan Issue lain, ganti `issue/4-app-foundation-docker` dengan nama branch Issue Anda sesuai daftar branch resmi tim (misalnya `issue/5-authentication-rbac` untuk `#5`). Jika branch Anda belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
+Untuk Issue lain, ganti `issue/4-app-foundation-docker` dengan nama branch Issue terkait (misalnya `issue/5-authentication-rbac` untuk `#5`). Jika branch tersebut belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
 
 ---
 

@@ -62,19 +62,19 @@ Daftar pemeriksaan yang wajib lulus:
 
 ---
 
-## 4. Pemisahan Pengujian Lokal, Automated CI Checks, Database Integration, dan Pengujian Fitur
+## 4. Pemisahan Pengujian Lokal, Automated CI Checks, dan Pengujian Paket
 
-Agar cakupan verifikasi antar tahap tidak tumpang tindih, proyek membagi lapisan pengujian sebagai berikut:
+Agar cakupan verifikasi antar tahap tidak tumpang tindih dan hasil pemeriksaan tidak diklaim secara keliru, proyek membagi lapisan pengujian sebagai berikut:
 
-1. **Pengujian lokal (Developer):** Dijalankan pengembang sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` atau Mode B `compose.yaml`).
-2. **Automated CI checks (GitHub Actions):** Berjalan otomatis pada `pull_request` dan `push` ke `main` melalui [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), mencakup tiga check:
-   - **`Quality Gate`:** `npm ci`, `typecheck`, `lint`, `build`, dan unit tests (`npm test`) pada Node.js `22.x`.
-   - **`Database Integration`:** Menjalankan service PostgreSQL Mode A (`compose.yaml` + `compose.dev.yaml`) secara terisolasi pada `127.0.0.1:5432`, memverifikasi readiness serta `SELECT 1` dari host runner, menegakkan proteksi anti-hapus schema terhadap base branch `main`, serta menjalankan gate kondisional Prisma.
-   - **`Docker Compose Integration`:** Validasi `compose.yaml` dan `compose.dev.yaml`, build image, healthcheck `db`/`api`/`web`, smoke test `/`, `/healthz`, `/api/v1/health`, `pg_isready` & `SELECT 1`, serta verifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
-3. **Database integration & integrity tests (`SBS-19`):**
-   - Sebelum `server/prisma/schema.prisma` tersedia (`SBS-19` belum di-merge), `Database Integration` hanya memverifikasi readiness PostgreSQL Mode A dan mencatat tahap Prisma sebagai tidak berlaku (`N/A`).
-   - Begitu `server/prisma/schema.prisma` tersedia pada `SBS-19` maupun PR setelahnya, CI mewajibkan keberadaan file migrasi (`server/prisma/migrations/**/migration.sql`), `server/prisma/seed.ts`, serta script nyata (non-placeholder) pada `server/package.json`, lalu mengeksekusi `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` pada `--workspace=server` terhadap PostgreSQL CI sementara.
-4. **Pengujian fitur bisnis dan deployment (`SBS-05`–`SBS-15`):** Pengujian autentikasi, alur bimbingan skripsi, upload revisi, notifikasi, serta validasi domain/deployment online dikerjakan bertahap pada Issue fitur dan infrastruktur masing-masing.
+1. **Pengujian lokal (Developer):** Dijalankan sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` atau Mode B `compose.yaml`).
+2. **`Quality Gate` (CI):** Memasang dependency dengan `npm ci` serta menjalankan `typecheck`, `lint`, `build`, dan unit tests (`npm test`) pada Node.js `22.x`.
+3. **`Database Integration` (CI):** Memisahkan empat komponen yang berbeda:
+   - *CI validator self-tests (`test_validate_db_contract.py`):* Menguji helper `.github/scripts/validate_db_contract.py` (anti-bypass schema/migration, isi SQL, `migration_lock.toml`, kontrak script, dan parser TAP); **bukan** pengganti test database aplikasi.
+   - *PostgreSQL smoke test Mode A:* Menyalakan service `db` (`127.0.0.1:5432`) dan memverifikasi `pg_isready` serta `SELECT 1` dari host runner.
+   - *Prisma validation, migration, dan seed (`SBS-19`):* Menjalankan `db:validate`, `db:migrate:deploy`, dan `db:seed` setelah `server/prisma/schema.prisma` tersedia.
+   - *Database integration & integrity tests (`SBS-19`):* Menjalankan `test:db` pada `server/src/__tests__/database/*.test.ts` (format TAP) dan memverifikasi minimal satu test benar-benar lulus. Pada baseline saat ini sebelum `SBS-19`, pemeriksaan Prisma dan database integrity tests berstatus **`N/A`** dan belum dijalankan.
+4. **`Docker Compose Integration` (CI):** Validasi `compose.yaml` dan `compose.dev.yaml`, build image, healthcheck `db`/`api`/`web`, smoke test `/`, `/healthz`, `/api/v1/health`, `pg_isready` & `SELECT 1`, serta verifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
+5. **Pengujian fitur bisnis dan deployment (`SBS-05`–`SBS-15`):** Pengujian autentikasi, alur bimbingan skripsi, upload revisi, notifikasi, serta validasi domain dan deployment online dikerjakan bertahap pada Issue masing-masing.
 
 ---
 
