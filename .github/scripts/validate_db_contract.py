@@ -16,7 +16,8 @@ from typing import Iterable
 
 
 FORBIDDEN_SHELL_RE = re.compile(r"[;|&><`$(){}\\\n\r\0]")
-STATIC_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:-]+$")
+ENV_ASSIGN_LIKE_RE = re.compile(r"^([^=\s]+)=(.*)$")
+SAFE_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SAFE_SCHEMA_PATH_RE = re.compile(r"^(?:\./)?[A-Za-z0-9_./-]+\.prisma$")
 SAFE_SEED_PATH_RE = re.compile(r"^(?:\./)?(?:prisma/)?seed\.[cm]?[jt]s$")
 SAFE_DB_TEST_PATH_RE = re.compile(
@@ -101,7 +102,9 @@ def get_base_migrations(repo_root: str, base_ref: str | None) -> dict[str, str]:
         if not line.strip():
             continue
         if "\t" not in line:
-            raise GitInspectionError("Unexpected output format from git ls-tree while inspecting base migrations.")
+            raise GitInspectionError(
+                "Unexpected output format from git ls-tree while inspecting base migrations."
+            )
         meta, rel_path = line.split("\t", 1)
         parts = meta.split()
         if len(parts) < 3:
@@ -238,8 +241,24 @@ def validate_database_test_files(repo_root: str) -> tuple[list[str], int]:
     return errors, runnable_files
 
 
+def validate_exact_executable_token(token: str, script_name: str, role: str = "executable") -> str | None:
+    if not token or token in {".", ".."}:
+        return f"server/package.json scripts.{script_name} has invalid {role} token"
+    if "/" in token or "\\" in token:
+        return (
+            f"server/package.json scripts.{script_name} cannot use a path-qualified {role} token"
+        )
+    if "=" in token or token.startswith("-"):
+        return f"server/package.json scripts.{script_name} has invalid {role} token"
+    return None
+
+
+def describe_env_var_name(raw_name: str) -> str:
+    return f"'{raw_name}'" if SAFE_VAR_NAME_RE.match(raw_name) else "<invalid>"
+
+
 def parse_single_direct_command(script_name: str, raw_cmd: object) -> tuple[str | None, list[str], str | None]:
-    """Parse one direct executable command without shell chaining or unsafe syntax."""
+    """Parse one direct command with strict executable tokens and explicit env allowlist."""
     if not isinstance(raw_cmd, str) or not raw_cmd.strip():
         return None, [], f"server/package.json scripts.{script_name} is missing or empty"
 
@@ -267,32 +286,70 @@ def parse_single_direct_command(script_name: str, raw_cmd: object) -> tuple[str 
             )
 
     idx = 0
-    while idx < len(tokens) and STATIC_ENV_RE.match(tokens[idx]):
+    seen_env = False
+    while idx < len(tokens):
+        env_match = ENV_ASSIGN_LIKE_RE.match(tokens[idx])
+        if not env_match:
+            break
+        var_name = env_match.group(1)
+        safe_var = describe_env_var_name(var_name)
+
+        if script_name != "test:db":
+            return (
+                None,
+                [],
+                f"server/package.json scripts.{script_name} does not allow environment assignment {safe_var}",
+            )
+        if seen_env:
+            return (
+                None,
+                [],
+                f"server/package.json scripts.{script_name} does not allow repeated environment assignment {safe_var}",
+            )
+        if tokens[idx] != "NODE_ENV=test":
+            return (
+                None,
+                [],
+                f"server/package.json scripts.{script_name} rejected disallowed environment variable {safe_var}; only NODE_ENV=test is permitted",
+            )
+        seen_env = True
         idx += 1
 
     if idx >= len(tokens):
-        return None, [], f"server/package.json scripts.{script_name} contains only environment assignments without a command"
+        return (
+            None,
+            [],
+            f"server/package.json scripts.{script_name} contains only an environment assignment without a command",
+        )
 
     remaining = tokens[idx:]
-    first = os.path.basename(remaining[0])
+    first = remaining[0]
+    first_err = validate_exact_executable_token(first, script_name, role="executable")
+    if first_err:
+        return None, [], first_err
 
     if first == "npx":
         rest = remaining[1:]
         if rest and rest[0] == "--no-install":
             rest = rest[1:]
-        if not rest or rest[0].startswith("-"):
+        if not rest:
             return (
                 None,
                 [],
-                f"server/package.json scripts.{script_name} uses unsupported npx flags or missing executable",
+                f"server/package.json scripts.{script_name} is missing target executable after npx",
             )
-        return os.path.basename(rest[0]), rest[1:], None
+        target_err = validate_exact_executable_token(rest[0], script_name, role="npx target executable")
+        if target_err:
+            return None, [], target_err
+        return rest[0], rest[1:], None
 
     if first == "npm":
         if len(remaining) >= 4 and remaining[1] == "exec" and remaining[2] == "--":
-            sub_exe = os.path.basename(remaining[3])
-            if not sub_exe.startswith("-"):
-                return sub_exe, remaining[4:], None
+            sub_exe = remaining[3]
+            target_err = validate_exact_executable_token(sub_exe, script_name, role="npm exec target executable")
+            if target_err:
+                return None, [], target_err
+            return sub_exe, remaining[4:], None
         return (
             None,
             [],
@@ -333,7 +390,7 @@ def consume_optional_prisma_schema_flag(args: list[str]) -> tuple[list[str], str
 
 def validate_db_validate_script(exe: str, args: list[str]) -> str | None:
     if exe != "prisma":
-        return "server/package.json scripts.db:validate must directly invoke 'prisma validate'"
+        return "server/package.json scripts.db:validate must directly invoke exact executable 'prisma validate'"
     core_args, err = consume_optional_prisma_schema_flag(args)
     if err:
         return f"server/package.json scripts.db:validate: {err}"
@@ -344,7 +401,7 @@ def validate_db_validate_script(exe: str, args: list[str]) -> str | None:
 
 def validate_db_migrate_deploy_script(exe: str, args: list[str]) -> str | None:
     if exe != "prisma":
-        return "server/package.json scripts.db:migrate:deploy must directly invoke 'prisma migrate deploy'"
+        return "server/package.json scripts.db:migrate:deploy must directly invoke exact executable 'prisma migrate deploy'"
     core_args, err = consume_optional_prisma_schema_flag(args)
     if err:
         return f"server/package.json scripts.db:migrate:deploy: {err}"
@@ -379,14 +436,14 @@ def validate_db_seed_script(exe: str, args: list[str]) -> str | None:
             return None
         return "server/package.json scripts.db:seed using node must strictly target a seed file without extra commands or flags"
 
-    return "server/package.json scripts.db:seed must directly invoke 'prisma db seed' or execute prisma/seed.ts via tsx/node"
+    return "server/package.json scripts.db:seed must directly invoke exact executable 'prisma', 'tsx', or 'node'"
 
 
 def validate_test_db_script(exe: str, args: list[str]) -> str | None:
     if exe not in {"node", "tsx"}:
         return (
-            "server/package.json scripts.test:db must directly invoke 'node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts' "
-            "or 'tsx --test --test-reporter=tap src/__tests__/database/*.test.ts'"
+            "server/package.json scripts.test:db must directly invoke exact executable 'node' or 'tsx' "
+            "targeting src/__tests__/database/*.test.ts with --test-reporter=tap"
         )
 
     saw_tsx_import = exe == "tsx"
@@ -623,6 +680,100 @@ def cmd_verify_tap(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_step_summary(
+    *,
+    validator_tests_outcome: str,
+    pg_health_outcome: str,
+    pg_connect_outcome: str,
+    contract_outcome: str,
+    run_prisma: str,
+    prisma_outcome: str,
+) -> str:
+    """Render honest GitHub Actions Step Summary table from actual step outcomes."""
+    infra_outcomes = {pg_health_outcome, pg_connect_outcome}
+    if infra_outcomes == {"success"}:
+        infra_status = "PASS"
+        infra_note = "Container healthy, host connection, pg_isready, SELECT 1"
+    elif "failure" in infra_outcomes:
+        infra_status = "FAIL"
+        infra_note = f"PostgreSQL check failed (health={pg_health_outcome}, connect={pg_connect_outcome})"
+    elif infra_outcomes <= {"skipped", ""}:
+        infra_status = "SKIPPED"
+        infra_note = "PostgreSQL checks were skipped because an earlier step failed"
+    else:
+        infra_status = "NOT COMPLETED"
+        infra_note = f"PostgreSQL checks did not finish (health={pg_health_outcome}, connect={pg_connect_outcome})"
+
+    val_outcomes = {validator_tests_outcome, contract_outcome}
+    if val_outcomes == {"success"}:
+        val_status = "PASS"
+        val_note = "Validator self-tests and schema/script contract check passed"
+    elif "failure" in val_outcomes:
+        val_status = "FAIL"
+        val_note = f"Validator check failed (self-tests={validator_tests_outcome}, contract={contract_outcome})"
+    elif contract_outcome == "skipped" and validator_tests_outcome == "success":
+        val_status = "NOT COMPLETED"
+        val_note = "Contract check did not run after earlier step failure"
+    elif val_outcomes <= {"skipped", ""}:
+        val_status = "SKIPPED"
+        val_note = "Validator checks were skipped"
+    else:
+        val_status = "NOT COMPLETED"
+        val_note = f"Validator incomplete (self-tests={validator_tests_outcome}, contract={contract_outcome})"
+
+    if contract_outcome == "success" and run_prisma == "false":
+        prisma_status = "N/A"
+        prisma_note = "Awaiting SBS-19 schema and database artifacts"
+    elif run_prisma == "true" and prisma_outcome == "success":
+        prisma_status = "PASS"
+        prisma_note = "Validate, migration deploy, seed, and database tests passed"
+    elif prisma_outcome == "failure":
+        prisma_status = "FAIL"
+        prisma_note = "Prisma validate, migration deploy, seed, or database tests failed"
+    else:
+        prisma_status = "NOT COMPLETED"
+        prisma_note = f"Did not complete (contract={contract_outcome}, prisma={prisma_outcome})"
+
+    if infra_status == "PASS" and val_status == "PASS" and prisma_status == "N/A":
+        overall_status = "SUCCESS"
+        overall_note = "All applicable baseline checks passed (application Prisma suite N/A before SBS-19)"
+    elif infra_status == "PASS" and val_status == "PASS" and prisma_status == "PASS":
+        overall_status = "SUCCESS"
+        overall_note = "All applicable database integration checks passed"
+    else:
+        overall_status = "FAILURE"
+        overall_note = "One or more required Database Integration checks failed or did not complete"
+
+    lines = [
+        "## Database Integration Coverage",
+        "",
+        "| Area | Status | Keterangan |",
+        "|---|---|---|",
+        f"| PostgreSQL infrastructure | {infra_status} | {infra_note} |",
+        f"| Database contract validator | {val_status} | {val_note} |",
+        f"| Prisma application integration | {prisma_status} | {prisma_note} |",
+        f"| Overall Database Integration | {overall_status} | {overall_note} |",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_write_summary(args: argparse.Namespace) -> int:
+    markdown = render_step_summary(
+        validator_tests_outcome=args.validator_tests_outcome,
+        pg_health_outcome=args.pg_health_outcome,
+        pg_connect_outcome=args.pg_connect_outcome,
+        contract_outcome=args.contract_outcome,
+        run_prisma=args.run_prisma,
+        prisma_outcome=args.prisma_outcome,
+    )
+    if args.summary_file:
+        with open(args.summary_file, "a", encoding="utf-8") as fh:
+            fh.write(markdown)
+    print(markdown)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CI validator for SBS-19 database contract")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -637,6 +788,16 @@ def build_parser() -> argparse.ArgumentParser:
     tap_p = subparsers.add_parser("verify-tap")
     tap_p.add_argument("--tap-file", required=True)
     tap_p.set_defaults(func=cmd_verify_tap)
+
+    sum_p = subparsers.add_parser("write-summary")
+    sum_p.add_argument("--summary-file", default="")
+    sum_p.add_argument("--validator-tests-outcome", required=True)
+    sum_p.add_argument("--pg-health-outcome", required=True)
+    sum_p.add_argument("--pg-connect-outcome", required=True)
+    sum_p.add_argument("--contract-outcome", required=True)
+    sum_p.add_argument("--run-prisma", default="")
+    sum_p.add_argument("--prisma-outcome", required=True)
+    sum_p.set_defaults(func=cmd_write_summary)
 
     return parser
 

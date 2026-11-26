@@ -119,11 +119,15 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
 
     def test_accepts_valid_direct_commands_without_chaining(self) -> None:
         valid_variants = [
+            {"db:validate": "prisma validate"},
             {"db:validate": "npx prisma validate"},
             {"db:validate": "npx --no-install prisma validate --schema=prisma/schema.prisma"},
+            {"db:migrate:deploy": "prisma migrate deploy"},
             {"db:migrate:deploy": "npm exec -- prisma migrate deploy"},
             {"db:seed": "prisma db seed"},
+            {"db:seed": "tsx prisma/seed.ts"},
             {"db:seed": "node --import tsx prisma/seed.ts"},
+            {"test:db": "node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"},
             {"test:db": "tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"},
             {
                 "test:db": "NODE_ENV=test node --import tsx --test --test-reporter tap src/__tests__/database/integrity.test.ts"
@@ -134,6 +138,83 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             code, gh_out, _ = self.run_check()
             self.assertEqual(code, 0, msg=f"Failed for valid script override: {override}")
             self.assertIn("run_prisma=true", gh_out)
+
+    def test_rejects_path_qualified_executables_and_prefixes(self) -> None:
+        bad_executables = [
+            ("db:validate", "./ci-bin/prisma validate"),
+            ("db:validate", "/tmp/prisma validate"),
+            ("db:migrate:deploy", "./ci-bin/prisma migrate deploy"),
+            ("db:migrate:deploy", "fake-bin/prisma migrate deploy"),
+            ("db:seed", "./ci-bin/tsx prisma/seed.ts"),
+            ("test:db", "./ci-bin/node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
+            ("db:validate", "./ci-bin/npx prisma validate"),
+            ("db:validate", "./ci-bin/npm exec -- prisma validate"),
+            ("db:validate", "npx ./ci-bin/prisma validate"),
+            ("db:validate", "npm exec -- ./ci-bin/prisma validate"),
+            ("db:migrate:deploy", "npx /tmp/prisma migrate deploy"),
+            ("db:seed", "npm exec -- ./ci-bin/tsx prisma/seed.ts"),
+            ("test:db", "npx ./ci-bin/tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
+        ]
+        for key, bad_cmd in bad_executables:
+            self.write_valid_sbs19_contract(overrides={key: bad_cmd})
+            code, _, logs = self.run_check()
+            self.assertEqual(
+                code,
+                1,
+                msg=f"Regression: path-qualified executable was accepted for {key}: {bad_cmd!r}",
+            )
+            self.assertIn("path-qualified", logs)
+
+    def test_rejects_path_and_env_manipulation_assignments(self) -> None:
+        bad_env_cases = [
+            ("db:validate", "PATH=./ci-bin prisma validate", "PATH"),
+            ("db:migrate:deploy", "PATH=./ci-bin prisma migrate deploy", "PATH"),
+            ("db:seed", "PATH=./ci-bin tsx prisma/seed.ts", "PATH"),
+            (
+                "test:db",
+                "PATH=./ci-bin node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
+                "PATH",
+            ),
+            (
+                "test:db",
+                "NODE_PATH=./ci-bin node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
+                "NODE_PATH",
+            ),
+            (
+                "test:db",
+                "NODE_OPTIONS=--inspect node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
+                "NODE_OPTIONS",
+            ),
+            ("db:validate", "HOME=./fake-home prisma validate", "HOME"),
+            ("db:validate", "IFS=/ prisma validate", "IFS"),
+            ("db:validate", "BASH_ENV=./evil.sh prisma validate", "BASH_ENV"),
+            ("db:validate", "ENV=./evil.sh prisma validate", "ENV"),
+            ("db:validate", "NODE_ENV=test prisma validate", "NODE_ENV"),
+            ("db:migrate:deploy", "NODE_ENV=test prisma migrate deploy", "NODE_ENV"),
+            ("db:seed", "NODE_ENV=test tsx prisma/seed.ts", "NODE_ENV"),
+            (
+                "test:db",
+                "NODE_ENV=production node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
+                "NODE_ENV",
+            ),
+            (
+                "test:db",
+                "NODE_ENV=test NODE_ENV=test node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
+                "NODE_ENV",
+            ),
+        ]
+        for key, bad_cmd, expected_var in bad_env_cases:
+            self.write_valid_sbs19_contract(overrides={key: bad_cmd})
+            code, _, logs = self.run_check()
+            self.assertEqual(
+                code,
+                1,
+                msg=f"Regression: unsafe env assignment accepted for {key}: {bad_cmd!r}",
+            )
+            self.assertIn(expected_var, logs)
+            self.assertNotIn("./ci-bin", logs)
+            self.assertNotIn("./fake-home", logs)
+            self.assertNotIn("--inspect", logs)
 
     def test_rejects_deleted_schema_from_base(self) -> None:
         self.write_valid_sbs19_contract()
@@ -387,6 +468,57 @@ class TapVerificationTests(unittest.TestCase):
 
         missing_summary = "TAP version 13\nok 1 - passes\n"
         self.assertEqual(self._verify(missing_summary), 1)
+
+
+class StepSummaryTests(unittest.TestCase):
+    def test_renders_baseline_na_summary_honestly(self) -> None:
+        md = v.render_step_summary(
+            validator_tests_outcome="success",
+            pg_health_outcome="success",
+            pg_connect_outcome="success",
+            contract_outcome="success",
+            run_prisma="false",
+            prisma_outcome="skipped",
+        )
+        self.assertIn("| PostgreSQL infrastructure | PASS |", md)
+        self.assertIn("| Database contract validator | PASS |", md)
+        self.assertIn("| Prisma application integration | N/A |", md)
+        self.assertIn("| Overall Database Integration | SUCCESS |", md)
+
+    def test_renders_full_sbs19_pass_and_failure_states(self) -> None:
+        full_ok = v.render_step_summary(
+            validator_tests_outcome="success",
+            pg_health_outcome="success",
+            pg_connect_outcome="success",
+            contract_outcome="success",
+            run_prisma="true",
+            prisma_outcome="success",
+        )
+        self.assertIn("| Prisma application integration | PASS |", full_ok)
+        self.assertIn("| Overall Database Integration | SUCCESS |", full_ok)
+
+        pg_fail = v.render_step_summary(
+            validator_tests_outcome="success",
+            pg_health_outcome="failure",
+            pg_connect_outcome="skipped",
+            contract_outcome="skipped",
+            run_prisma="",
+            prisma_outcome="skipped",
+        )
+        self.assertIn("| PostgreSQL infrastructure | FAIL |", pg_fail)
+        self.assertIn("| Prisma application integration | NOT COMPLETED |", pg_fail)
+        self.assertIn("| Overall Database Integration | FAILURE |", pg_fail)
+
+        prisma_fail = v.render_step_summary(
+            validator_tests_outcome="success",
+            pg_health_outcome="success",
+            pg_connect_outcome="success",
+            contract_outcome="success",
+            run_prisma="true",
+            prisma_outcome="failure",
+        )
+        self.assertIn("| Prisma application integration | FAIL |", prisma_fail)
+        self.assertIn("| Overall Database Integration | FAILURE |", prisma_fail)
 
 
 if __name__ == "__main__":

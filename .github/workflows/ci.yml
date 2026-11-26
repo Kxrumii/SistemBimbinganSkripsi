@@ -36,6 +36,7 @@ jobs:
         run: npm ci
 
       - name: Run CI database contract validator self-tests
+        id: validator_tests
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
       - name: Typecheck workspaces
@@ -74,6 +75,7 @@ jobs:
         run: npm ci
 
       - name: Run CI database contract validator self-tests
+        id: validator_tests
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
       - name: Prepare ephemeral DB CI environment file
@@ -111,6 +113,7 @@ jobs:
             -f compose.yaml -f compose.dev.yaml up -d db
 
       - name: Wait for PostgreSQL to become healthy
+        id: pg_health
         run: |
           python3 - <<'PY'
           import json, os, subprocess, time
@@ -136,6 +139,7 @@ jobs:
           PY
 
       - name: Verify PostgreSQL port binding and host-runner connectivity
+        id: pg_connect
         run: |
           python3 - <<'PY'
           import json, os, socket, subprocess
@@ -186,6 +190,7 @@ jobs:
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Run Prisma validation, migration deploy, seed, and database tests
+        id: prisma_suite
         if: steps.db_contract.outputs.run_prisma == 'true'
         run: |
           set -o pipefail
@@ -217,6 +222,18 @@ jobs:
               -f compose.yaml -f compose.dev.yaml down --remove-orphans || true
             rm -f "${ENV_TARGET}"
           fi
+
+      - name: Publish Database Integration coverage summary
+        if: always()
+        run: |
+          python3 .github/scripts/validate_db_contract.py write-summary \
+            --summary-file "${GITHUB_STEP_SUMMARY}" \
+            --validator-tests-outcome "${{ steps.validator_tests.outcome }}" \
+            --pg-health-outcome "${{ steps.pg_health.outcome }}" \
+            --pg-connect-outcome "${{ steps.pg_connect.outcome }}" \
+            --contract-outcome "${{ steps.db_contract.outcome }}" \
+            --run-prisma "${{ steps.db_contract.outputs.run_prisma }}" \
+            --prisma-outcome "${{ steps.prisma_suite.outcome }}"
 
   docker-compose-integration:
     name: Docker Compose Integration
