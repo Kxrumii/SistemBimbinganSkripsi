@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for .github/scripts/validate_db_contract.py."""
+"""Unit and regression tests for .github/scripts/validate_db_contract.py."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,9 +22,23 @@ if str(SCRIPT_DIR) not in sys.path:
 import validate_db_contract as v  # noqa: E402
 
 
+CANONICAL_CONFIG_CONTENT = """import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: {
+    path: "prisma/migrations",
+  },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+  },
+});
+"""
+
 VALID_SCRIPTS = {
-    "db:validate": "prisma validate",
-    "db:migrate:deploy": "prisma migrate deploy",
+    "db:validate": "prisma validate --schema=prisma/schema.prisma",
+    "db:migrate:deploy": "prisma migrate deploy --schema=prisma/schema.prisma",
     "db:seed": "tsx prisma/seed.ts",
     "test:db": "node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
 }
@@ -37,6 +52,14 @@ class TempRepoTestCase(unittest.TestCase):
         self._git(["config", "user.email", "ci@example.test"])
         self._git(["config", "user.name", "CI Test"])
         self.write_file("README.md", "# Test repo\n")
+        self.write_file(
+            "package.json",
+            json.dumps({"name": "test-root", "private": True, "workspaces": ["server"]}, indent=2),
+        )
+        self.write_file(
+            "package-lock.json",
+            json.dumps({"name": "test-root", "lockfileVersion": 3, "packages": {"": {"name": "test-root"}}}, indent=2),
+        )
         self.base_sha = self.commit_all("initial")
 
     def tearDown(self) -> None:
@@ -66,7 +89,19 @@ class TempRepoTestCase(unittest.TestCase):
         self,
         overrides: dict[str, str] | None = None,
         prisma_cfg: object | None = None,
+        *,
+        prisma_cli_version: str = "7.10.1",
+        prisma_client_version: str = "7.10.1",
+        lock_cli_version: str = "7.10.1",
+        lock_client_version: str = "7.10.1",
+        nested_lock: bool = False,
+        config_content: str = CANONICAL_CONFIG_CONTENT,
     ) -> None:
+        self.write_file(
+            "package.json",
+            json.dumps({"name": "test-root", "private": True, "workspaces": ["server"]}, indent=2),
+        )
+        self.write_file("server/prisma7.config.ts", config_content)
         self.write_file("server/prisma/schema.prisma", 'datasource db {\n  provider = "postgresql"\n}\n')
         self.write_file(
             "server/prisma/migrations/migration_lock.toml",
@@ -85,10 +120,33 @@ class TempRepoTestCase(unittest.TestCase):
         scripts = dict(VALID_SCRIPTS)
         if overrides:
             scripts.update(overrides)
-        pkg_obj: dict[str, object] = {"scripts": scripts}
+        pkg_obj: dict[str, object] = {
+            "name": "sbs-server",
+            "dependencies": {"@prisma/client": prisma_client_version},
+            "devDependencies": {"prisma": prisma_cli_version},
+            "scripts": scripts,
+        }
         if prisma_cfg is not None:
             pkg_obj["prisma"] = prisma_cfg
         self.write_file("server/package.json", json.dumps(pkg_obj, indent=2))
+
+        cli_key = "server/node_modules/prisma" if nested_lock else "node_modules/prisma"
+        client_key = "server/node_modules/@prisma/client" if nested_lock else "node_modules/@prisma/client"
+        lock_obj = {
+            "name": "test-root",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "test-root", "workspaces": ["server"]},
+                "server": {
+                    "name": "sbs-server",
+                    "dependencies": {"@prisma/client": prisma_client_version},
+                    "devDependencies": {"prisma": prisma_cli_version},
+                },
+                cli_key: {"version": lock_cli_version},
+                client_key: {"version": lock_client_version},
+            },
+        }
+        self.write_file("package-lock.json", json.dumps(lock_obj, indent=2))
 
     def run_check(
         self, event_name: str = "pull_request", base_sha: str | None = None
@@ -112,6 +170,12 @@ class TempRepoTestCase(unittest.TestCase):
             )
         return code, gh_out.read_text(encoding="utf-8"), buf.getvalue()
 
+    def run_runtime_version_check(self) -> tuple[int, str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = v.main(["verify-runtime-versions", "--repo-root", str(self.root)])
+        return code, buf.getvalue()
+
 
 class DatabaseContractValidatorTests(TempRepoTestCase):
     def test_pre_sbs19_baseline_returns_na_and_passes(self) -> None:
@@ -124,18 +188,75 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
         self.assertIn("run_prisma=false", gh_out)
         self.assertIn("N/A", logs)
 
+    def test_rejects_partial_sbs19_artifacts_without_returning_na(self) -> None:
+        # 1. Canonical config exists without schema
+        self.write_file("server/prisma7.config.ts", CANONICAL_CONFIG_CONTENT)
+        code, gh_out, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("run_prisma=false", gh_out)
+        self.assertIn("Partial SBS-19", logs)
+        os.remove(self.root / "server/prisma7.config.ts")
+
+        # 2. Schema exists without canonical server/prisma7.config.ts
+        self.write_valid_sbs19_contract()
+        os.remove(self.root / "server/prisma7.config.ts")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("server/prisma7.config.ts must exist", logs)
+        shutil.rmtree(self.root / "server/prisma")
+        os.remove(self.root / "server/package.json")
+        shutil.rmtree(self.root / "server/src/__tests__/database")
+
+        # 3. Dependency prisma declared without schema
+        self.write_file(
+            "package-lock.json",
+            json.dumps({"name": "test-root", "lockfileVersion": 3, "packages": {"": {"name": "test-root"}}}),
+        )
+        self.write_file(
+            "server/package.json",
+            json.dumps({"devDependencies": {"prisma": "7.10.1"}, "scripts": {"test": "tsx --test src/__tests__/*.test.ts"}}),
+        )
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Partial SBS-19 dependency", logs)
+
+        # 4. Partial DB script without schema
+        self.write_file(
+            "server/package.json",
+            json.dumps({"scripts": {"db:validate": "prisma validate --schema=prisma/schema.prisma"}}),
+        )
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Partial SBS-19 script", logs)
+
+        # 5. server/prisma/migrations or seed.ts without schema
+        self.write_file("server/package.json", json.dumps({"scripts": {"test": "tsx --test src/__tests__/*.test.ts"}}))
+        self.write_file("server/prisma/seed.ts", "async function main() {}\n")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Partial SBS-19 artifact", logs)
+        shutil.rmtree(self.root / "server/prisma")
+
+        # 6. Database test dir without schema
+        self.write_file("server/src/__tests__/database/integrity.test.ts", "test('x', () => {});\n")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Partial SBS-19 artifact", logs)
+        shutil.rmtree(self.root / "server/src/__tests__/database")
+
+        # 7. Forbidden alias on baseline without schema
+        self.write_file("prisma.config.ts", "export default {};\n")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Alternate Prisma config file", logs)
+
     def test_accepts_valid_direct_commands_and_canonical_schema(self) -> None:
         valid_variants = [
-            {"db:validate": "prisma validate"},
             {"db:validate": "prisma validate --schema=prisma/schema.prisma"},
             {"db:validate": "prisma validate --schema prisma/schema.prisma"},
-            {"db:migrate:deploy": "prisma migrate deploy"},
             {"db:migrate:deploy": "prisma migrate deploy --schema=prisma/schema.prisma"},
             {"db:migrate:deploy": "prisma migrate deploy --schema prisma/schema.prisma"},
-            {"db:seed": "prisma db seed"},
-            {"db:seed": "prisma db seed --schema=prisma/schema.prisma"},
             {"db:seed": "tsx prisma/seed.ts"},
-            {"db:seed": "node --import tsx prisma/seed.ts"},
             {"test:db": "node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"},
             {"test:db": "tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"},
             {
@@ -144,12 +265,13 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
         ]
         for override in valid_variants:
             self.write_valid_sbs19_contract(overrides=override)
-            code, gh_out, _ = self.run_check()
-            self.assertEqual(code, 0, msg=f"Failed for valid script override: {override}")
+            code, gh_out, logs = self.run_check()
+            self.assertEqual(code, 0, msg=f"Failed for valid script override {override}: {logs}")
             self.assertIn("run_prisma=true", gh_out)
 
-    def test_rejects_alternate_schema_paths_traversal_and_config_redirection(self) -> None:
+    def test_rejects_omitted_or_alternate_schema_flags_and_config_redirection(self) -> None:
         bad_schema_cmds = [
+            ("db:validate", "prisma validate"),
             ("db:validate", "prisma validate --schema=alternate/schema.prisma"),
             ("db:validate", "prisma validate --schema alternate/schema.prisma"),
             ("db:validate", "prisma validate --schema=/tmp/schema.prisma"),
@@ -159,8 +281,9 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             ("db:validate", 'prisma validate --schema ""'),
             ("db:validate", "prisma validate --schema"),
             ("db:validate", "prisma validate --schema=prisma/schema.prisma --schema=prisma/schema.prisma"),
-            ("db:validate", "prisma validate --config=prisma.config.ts"),
-            ("db:validate", "prisma validate --config prisma.config.ts"),
+            ("db:validate", "prisma validate --schema=prisma/schema.prisma --config=prisma7.config.ts"),
+            ("db:validate", "prisma validate --schema=prisma/schema.prisma --config prisma.config.ts"),
+            ("db:migrate:deploy", "prisma migrate deploy"),
             ("db:migrate:deploy", "prisma migrate deploy --schema=alternate/schema.prisma"),
             ("db:migrate:deploy", "prisma migrate deploy --schema=/tmp/schema.prisma"),
             ("db:migrate:deploy", "prisma migrate deploy --schema=../other/schema.prisma"),
@@ -168,7 +291,12 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             ("db:migrate:deploy", "prisma migrate deploy --schema="),
             ("db:migrate:deploy", "prisma migrate deploy --schema"),
             ("db:migrate:deploy", "prisma migrate deploy --schema=prisma/schema.prisma --schema=prisma/schema.prisma"),
-            ("db:migrate:deploy", "prisma migrate deploy --config=prisma.config.ts"),
+            ("db:migrate:deploy", "prisma migrate deploy --schema=prisma/schema.prisma --config=prisma.config.ts"),
+            ("db:seed", "prisma db seed"),
+            ("db:seed", "prisma db seed --schema=prisma/schema.prisma"),
+            ("db:seed", "node --import tsx prisma/seed.ts"),
+            ("db:seed", "tsx seed.ts"),
+            ("db:seed", "tsx prisma/other-seed.ts"),
         ]
         for key, bad_cmd in bad_schema_cmds:
             self.write_valid_sbs19_contract(overrides={key: bad_cmd})
@@ -176,43 +304,53 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
             self.assertEqual(
                 code,
                 1,
-                msg=f"Regression: non-canonical schema or config flag accepted for {key}: {bad_cmd!r}",
+                msg=f"Regression: disallowed schema, config, or seed flag accepted for {key}: {bad_cmd!r}",
             )
 
-        for cfg_rel in ("server/prisma.config.ts", "server/prisma.config.mjs", "prisma.config.ts"):
-            self.write_valid_sbs19_contract()
-            self.write_file(cfg_rel, "export default { schema: 'alternate/schema.prisma' };\n")
-            code, _, logs = self.run_check()
-            self.assertEqual(code, 1, msg=f"Expected rejection when {cfg_rel} exists")
-            self.assertIn("not permitted", logs)
-            os.remove(self.root / cfg_rel)
-
-        self.write_valid_sbs19_contract(prisma_cfg={"schema": "prisma/schema.prisma", "seed": "tsx prisma/seed.ts"})
-        code, _, _ = self.run_check()
-        self.assertEqual(code, 0)
-
+    def test_rejects_package_json_prisma_redirection_and_invalid_json(self) -> None:
         for bad_prisma_cfg in (
+            {"schema": "prisma/schema.prisma", "seed": "tsx prisma/seed.ts"},
             {"schema": "alternate/schema.prisma"},
             {"migrations": "alternate/migrations"},
-            {"schema": "prisma/schema.prisma", "seed": "npx tsx prisma/seed.ts"},
+            "prisma/schema.prisma",
         ):
             self.write_valid_sbs19_contract(prisma_cfg=bad_prisma_cfg)
-            code, _, _ = self.run_check()
+            code, _, logs = self.run_check()
             self.assertEqual(code, 1, msg=f"Expected rejection for server/package.json prisma={bad_prisma_cfg!r}")
+            self.assertIn("legacy 'prisma'", logs)
+
+        self.write_valid_sbs19_contract()
+        self.write_file(
+            "package.json",
+            json.dumps({"name": "root", "workspaces": ["server"], "prisma": {"schema": "server/prisma/schema.prisma"}}),
+        )
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Root package.json cannot define a 'prisma'", logs)
+
+        self.write_valid_sbs19_contract()
+        self.write_file("server/package.json", "{ invalid json")
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 1)
+
+        self.write_valid_sbs19_contract()
+        self.write_file("package.json", "{ invalid json")
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 1)
 
     def test_rejects_npx_and_npm_exec_wrappers_across_all_four_scripts(self) -> None:
         wrapper_cmds = [
-            ("db:validate", "npx prisma validate"),
-            ("db:validate", "npx --no-install prisma validate"),
-            ("db:validate", "npm exec -- prisma validate"),
-            ("db:migrate:deploy", "npx prisma migrate deploy"),
-            ("db:migrate:deploy", "npm exec -- prisma migrate deploy"),
+            ("db:validate", "npx prisma validate --schema=prisma/schema.prisma"),
+            ("db:validate", "npx --no-install prisma validate --schema=prisma/schema.prisma"),
+            ("db:validate", "npm exec -- prisma validate --schema=prisma/schema.prisma"),
+            ("db:migrate:deploy", "npx prisma migrate deploy --schema=prisma/schema.prisma"),
+            ("db:migrate:deploy", "npm exec -- prisma migrate deploy --schema=prisma/schema.prisma"),
             ("db:seed", "npx tsx prisma/seed.ts"),
             ("db:seed", "npm exec -- tsx prisma/seed.ts"),
             ("test:db", "npx tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
             ("test:db", "npm exec -- node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
-            ("db:validate", "npx ./ci-bin/prisma validate"),
-            ("db:validate", "npm exec -- ./ci-bin/prisma validate"),
+            ("db:validate", "npx ./ci-bin/prisma validate --schema=prisma/schema.prisma"),
+            ("db:validate", "npm exec -- ./ci-bin/prisma validate --schema=prisma/schema.prisma"),
         ]
         for key, bad_cmd in wrapper_cmds:
             self.write_valid_sbs19_contract(overrides={key: bad_cmd})
@@ -229,14 +367,14 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
 
     def test_rejects_path_qualified_executables_and_prefixes(self) -> None:
         bad_executables = [
-            ("db:validate", "./ci-bin/prisma validate"),
-            ("db:validate", "/tmp/prisma validate"),
-            ("db:migrate:deploy", "./ci-bin/prisma migrate deploy"),
-            ("db:migrate:deploy", "fake-bin/prisma migrate deploy"),
+            ("db:validate", "./ci-bin/prisma validate --schema=prisma/schema.prisma"),
+            ("db:validate", "/tmp/prisma validate --schema=prisma/schema.prisma"),
+            ("db:migrate:deploy", "./ci-bin/prisma migrate deploy --schema=prisma/schema.prisma"),
+            ("db:migrate:deploy", "fake-bin/prisma migrate deploy --schema=prisma/schema.prisma"),
             ("db:seed", "./ci-bin/tsx prisma/seed.ts"),
             ("test:db", "./ci-bin/node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts"),
-            ("db:validate", "./ci-bin/npx prisma validate"),
-            ("db:validate", "./ci-bin/npm exec -- prisma validate"),
+            ("db:validate", "./ci-bin/npx prisma validate --schema=prisma/schema.prisma"),
+            ("db:validate", "./ci-bin/npm exec -- prisma validate --schema=prisma/schema.prisma"),
         ]
         for key, bad_cmd in bad_executables:
             self.write_valid_sbs19_contract(overrides={key: bad_cmd})
@@ -250,8 +388,8 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
 
     def test_rejects_path_and_env_manipulation_assignments(self) -> None:
         bad_env_cases = [
-            ("db:validate", "PATH=./ci-bin prisma validate", "PATH"),
-            ("db:migrate:deploy", "PATH=./ci-bin prisma migrate deploy", "PATH"),
+            ("db:validate", "PATH=./ci-bin prisma validate --schema=prisma/schema.prisma", "PATH"),
+            ("db:migrate:deploy", "PATH=./ci-bin prisma migrate deploy --schema=prisma/schema.prisma", "PATH"),
             ("db:seed", "PATH=./ci-bin tsx prisma/seed.ts", "PATH"),
             (
                 "test:db",
@@ -268,12 +406,12 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
                 "NODE_OPTIONS=--inspect node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts",
                 "NODE_OPTIONS",
             ),
-            ("db:validate", "HOME=./fake-home prisma validate", "HOME"),
-            ("db:validate", "IFS=/ prisma validate", "IFS"),
-            ("db:validate", "BASH_ENV=./evil.sh prisma validate", "BASH_ENV"),
-            ("db:validate", "ENV=./evil.sh prisma validate", "ENV"),
-            ("db:validate", "NODE_ENV=test prisma validate", "NODE_ENV"),
-            ("db:migrate:deploy", "NODE_ENV=test prisma migrate deploy", "NODE_ENV"),
+            ("db:validate", "HOME=./fake-home prisma validate --schema=prisma/schema.prisma", "HOME"),
+            ("db:validate", "IFS=/ prisma validate --schema=prisma/schema.prisma", "IFS"),
+            ("db:validate", "BASH_ENV=./evil.sh prisma validate --schema=prisma/schema.prisma", "BASH_ENV"),
+            ("db:validate", "ENV=./evil.sh prisma validate --schema=prisma/schema.prisma", "ENV"),
+            ("db:validate", "NODE_ENV=test prisma validate --schema=prisma/schema.prisma", "NODE_ENV"),
+            ("db:migrate:deploy", "NODE_ENV=test prisma migrate deploy --schema=prisma/schema.prisma", "NODE_ENV"),
             ("db:seed", "NODE_ENV=test tsx prisma/seed.ts", "NODE_ENV"),
             (
                 "test:db",
@@ -379,8 +517,8 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
 
     def test_rejects_unapproved_arguments_on_database_scripts(self) -> None:
         bad_args = {
-            "db:validate": "prisma migrate reset",
-            "db:migrate:deploy": "prisma migrate dev",
+            "db:validate": "prisma migrate reset --schema=prisma/schema.prisma",
+            "db:migrate:deploy": "prisma migrate dev --schema=prisma/schema.prisma",
             "db:seed": "tsx src/server.ts",
             "test:db": "node --import tsx --test --test-reporter=tap src/__tests__/database/integrity.test.ts src/__tests__/health.test.ts",
         }
@@ -435,7 +573,241 @@ class DatabaseContractValidatorTests(TempRepoTestCase):
         os.remove(self.root / "server/prisma/migrations/20261126000000_init/migration.sql")
         code, _, logs = self.run_check(base_sha=base_with_mig)
         self.assertEqual(code, 1)
-        self.assertIn("cannot be deleted or renamed", logs)
+        self.assertIn("cannot be deleted, symlinked, or renamed", logs)
+
+
+class VersionAndLockfileTests(TempRepoTestCase):
+    def test_accepts_exact_prisma_7_10_1_hoisted_and_nested_lockfile(self) -> None:
+        for nested in (False, True):
+            self.write_valid_sbs19_contract(nested_lock=nested)
+            code, gh_out, logs = self.run_check()
+            self.assertEqual(code, 0, msg=f"nested={nested} failed: {logs}")
+            self.assertIn("run_prisma=true", gh_out)
+            self.assertIn("Prisma 7.10.1", logs)
+
+    def test_rejects_prisma_8_rc_prisma_6_ranges_mismatches_and_lockfile_drift(self) -> None:
+        bad_version_cases = [
+            dict(prisma_cli_version="8.0.0-rc.35", prisma_client_version="8.0.0-rc.35", lock_cli_version="8.0.0-rc.35", lock_client_version="8.0.0-rc.35"),
+            dict(prisma_cli_version="6.19.0", prisma_client_version="6.19.0", lock_cli_version="6.19.0", lock_client_version="6.19.0"),
+            dict(prisma_cli_version="^7.10.1"),
+            dict(prisma_client_version="~7.10.1"),
+            dict(prisma_cli_version="latest"),
+            dict(prisma_cli_version="7.10.0"),
+            dict(prisma_client_version="7.10.0"),
+            dict(lock_cli_version="7.10.0"),
+            dict(lock_client_version="8.0.0-rc.10"),
+            dict(nested_lock=True, lock_cli_version="7.10.0"),
+            dict(nested_lock=True, lock_client_version="6.19.0"),
+        ]
+        for case in bad_version_cases:
+            self.write_valid_sbs19_contract(**case)
+            code, _, _ = self.run_check()
+            self.assertEqual(code, 1, msg=f"Version contract accepted disallowed version spec: {case!r}")
+
+    def test_rejects_missing_or_misplaced_prisma_dependencies_or_lockfile(self) -> None:
+        self.write_valid_sbs19_contract()
+        # Missing prisma from package-lock.json
+        self.write_file("package-lock.json", json.dumps({"name": "root", "lockfileVersion": 3, "packages": {}}))
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 1)
+
+        # server/package-lock.json forbidden
+        self.write_valid_sbs19_contract()
+        self.write_file("server/package-lock.json", "{}")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("server/package-lock.json", logs)
+        os.remove(self.root / "server/package-lock.json")
+
+        # prisma placed in server dependencies instead of devDependencies
+        self.write_valid_sbs19_contract()
+        pkg = json.loads((self.root / "server/package.json").read_text(encoding="utf-8"))
+        pkg["dependencies"]["prisma"] = "7.10.1"
+        self.write_file("server/package.json", json.dumps(pkg))
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 1)
+
+        # root package.json overrides prisma
+        self.write_valid_sbs19_contract()
+        self.write_file(
+            "package.json",
+            json.dumps({"name": "root", "workspaces": ["server"], "overrides": {"prisma": "8.0.0-rc.35"}}),
+        )
+        code, _, _ = self.run_check()
+        self.assertEqual(code, 1)
+
+    def test_verify_runtime_versions_subcommand(self) -> None:
+        self.write_file("node_modules/prisma/package.json", json.dumps({"name": "prisma", "version": "7.10.1"}))
+        self.write_file("node_modules/@prisma/client/package.json", json.dumps({"name": "@prisma/client", "version": "7.10.1"}))
+        code, logs = self.run_runtime_version_check()
+        self.assertEqual(code, 0, msg=logs)
+
+        # Nested server/node_modules mismatch overrides root
+        self.write_file("server/node_modules/prisma/package.json", json.dumps({"name": "prisma", "version": "8.0.0-rc.35"}))
+        code, logs = self.run_runtime_version_check()
+        self.assertEqual(code, 1)
+        self.assertIn("8.0.0-rc.35", logs)
+
+
+class CanonicalConfigTests(TempRepoTestCase):
+    def test_accepts_canonical_config_and_safe_formatting_variants(self) -> None:
+        single_quote_variant = """import 'dotenv/config'
+import { defineConfig, } from 'prisma/config'
+
+export default defineConfig({
+  datasource: {
+    url: process.env['DATABASE_URL'],
+  },
+  migrations: {
+    path: 'prisma/migrations',
+  },
+  schema: 'prisma/schema.prisma',
+})
+"""
+        self.write_valid_sbs19_contract(config_content=single_quote_variant)
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 0, msg=logs)
+
+    def test_rejects_modified_or_dynamic_canonical_config_contents(self) -> None:
+        bad_configs = [
+            "",
+            CANONICAL_CONFIG_CONTENT.replace('"prisma/schema.prisma"', '"prisma/alt.prisma"'),
+            CANONICAL_CONFIG_CONTENT.replace('"prisma/migrations"', '"prisma/alt_migrations"'),
+            CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', '"postgresql://user:pass@localhost/db"'),
+            CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'process.env["CUSTOM_DB_URL"]'),
+            CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'env("DATABASE_URL")'),
+            CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'process.env["DATABASE_URL"] || ""'),
+            'import "dotenv/config";\nimport { readFileSync } from "node:fs";\n' + CANONICAL_CONFIG_CONTENT.split("\n", 1)[1],
+            CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', '...baseConfig,\n  schema: "prisma/schema.prisma",'),
+            CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', '["schema"]: "prisma/schema.prisma",'),
+            CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', 'schema: true ? "prisma/schema.prisma" : "other.prisma",'),
+            CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', 'schema: getSchema(),'),
+            CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', 'schema: `prisma/schema.prisma`,'),
+            CANONICAL_CONFIG_CONTENT + '\nconsole.log("side effect");\n',
+            "// hidden comment\n" + CANONICAL_CONFIG_CONTENT,
+            CANONICAL_CONFIG_CONTENT.replace("prisma/config", r"\x70risma/config"),
+        ]
+        for bad_cfg in bad_configs:
+            self.write_valid_sbs19_contract(config_content=bad_cfg)
+            code, _, _ = self.run_check()
+            self.assertEqual(code, 1, msg=f"Accepted invalid prisma7.config.ts:\n{bad_cfg}")
+
+    def test_rejects_symlinks_for_canonical_config_and_schema(self) -> None:
+        self.write_valid_sbs19_contract()
+        target = self.root / "external.ts"
+        target.write_text(CANONICAL_CONFIG_CONTENT, encoding="utf-8")
+        os.remove(self.root / "server/prisma7.config.ts")
+        os.symlink(target, self.root / "server/prisma7.config.ts")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Symlink", logs)
+
+        self.write_valid_sbs19_contract()
+        schema_target = self.root / "alt-schema.prisma"
+        schema_target.write_text('datasource db {\n  provider = "postgresql"\n}\n', encoding="utf-8")
+        os.remove(self.root / "server/prisma/schema.prisma")
+        os.symlink(schema_target, self.root / "server/prisma/schema.prisma")
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("Symlink", logs)
+
+
+class ConfigDiscoveryAliasTests(TempRepoTestCase):
+    def test_rejects_every_alternate_config_filename_extension_directory_and_symlink(self) -> None:
+        extensions = (".js", ".ts", ".mjs", ".cjs", ".mts", ".cts")
+        basenames = (
+            "prisma.config",
+            "prisma7.config",
+            ".config/prisma",
+            ".config/prisma7",
+            ".config/prisma.config",
+            ".config/prisma7.config",
+        )
+        candidates: list[str] = []
+        for prefix in ("", "server/"):
+            for base in basenames:
+                for ext in extensions:
+                    direct = f"{prefix}{base}{ext}"
+                    if direct != "server/prisma7.config.ts":
+                        candidates.append(direct)
+                    candidates.append(f"{prefix}{base}/index{ext}")
+
+        self.write_valid_sbs19_contract()
+        for rel in candidates:
+            target = self.root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("export default {};\n", encoding="utf-8")
+            code, _, logs = self.run_check()
+            self.assertEqual(code, 1, msg=f"Regression: Prisma config alias '{rel}' was NOT rejected!")
+            self.assertIn(rel, logs)
+            target.unlink()
+            # Clean directory if we created index.* subdir
+            if rel.endswith(f"/index{Path(rel).suffix}") and target.parent.exists():
+                target.parent.rmdir()
+
+        # Also test dangling symlink alias and stray alternate schema files
+        dangling = self.root / "prisma.config.ts"
+        os.symlink("/nonexistent/prisma.config.ts", dangling)
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("prisma.config.ts", logs)
+        dangling.unlink()
+
+        for stray_schema in ("schema.prisma", "prisma/schema.prisma", "server/schema.prisma"):
+            self.write_file(stray_schema, 'datasource db { provider = "postgresql" }\n')
+            code, _, logs = self.run_check()
+            self.assertEqual(code, 1, msg=f"Stray schema {stray_schema} not rejected")
+            self.assertIn(stray_schema, logs)
+            os.remove(self.root / stray_schema)
+
+
+class WorkspaceResolutionTests(unittest.TestCase):
+    def test_npm_workspace_runs_inside_server_directory_where_canonical_config_resolves(self) -> None:
+        npm_bin = shutil.which("npm")
+        if not npm_bin:
+            self.skipTest("npm binary is unavailable in environment")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"name": "ws-probe", "private": True, "workspaces": ["server"]}, indent=2),
+                encoding="utf-8",
+            )
+            (root / "server/prisma/migrations").mkdir(parents=True, exist_ok=True)
+            (root / "server/prisma7.config.ts").write_text(CANONICAL_CONFIG_CONTENT, encoding="utf-8")
+            (root / "server/prisma/schema.prisma").write_text(
+                'datasource db {\n  provider = "postgresql"\n}\n', encoding="utf-8"
+            )
+            probe_js = (
+                "const fs=require('fs'),path=require('path');"
+                "console.log(JSON.stringify({"
+                "cwd:fs.realpathSync(process.cwd()),"
+                "hasCfg:fs.existsSync('prisma7.config.ts'),"
+                "hasSchema:fs.existsSync(path.join('prisma','schema.prisma'))"
+                "}))"
+            )
+            (root / "server/package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "sbs-server-probe",
+                        "private": True,
+                        "scripts": {"probe:ws": f'node -e "{probe_js}"'},
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            res = subprocess.run(
+                [npm_bin, "run", "--silent", "probe:ws", "--workspace=server"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            payload = json.loads(res.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["cwd"], str((root / "server").resolve()))
+            self.assertTrue(payload["hasCfg"])
+            self.assertTrue(payload["hasSchema"])
 
 
 class BaseResolutionAndMigrationFailClosedTests(TempRepoTestCase):
@@ -465,14 +837,12 @@ class BaseResolutionAndMigrationFailClosedTests(TempRepoTestCase):
             self.assertEqual(code, 1)
 
     def test_workflow_dispatch_resolves_parent_and_fails_closed_when_unavailable(self) -> None:
-        # On root commit (no HEAD^), workflow_dispatch must fail closed
         ref, err = v.resolve_base_ref(str(self.root), "workflow_dispatch", "")
         self.assertIsNone(ref)
         self.assertIsNotNone(err)
         code, _, _ = self.run_check(event_name="workflow_dispatch", base_sha="")
         self.assertEqual(code, 1)
 
-        # After a second commit, workflow_dispatch resolves parent HEAD^
         self.write_file("README.md", "# Updated repo\n")
         self.commit_all("second commit")
         ref, err = v.resolve_base_ref(str(self.root), "workflow_dispatch", "")
@@ -481,7 +851,6 @@ class BaseResolutionAndMigrationFailClosedTests(TempRepoTestCase):
         code, _, _ = self.run_check(event_name="workflow_dispatch", base_sha="")
         self.assertEqual(code, 0)
 
-        # Mocked git rev-parse failure fails closed
         real_run_git = v.run_git
 
         def fake_rev_parse(repo_root: str, args: list[str]) -> subprocess.CompletedProcess[str]:

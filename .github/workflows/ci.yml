@@ -194,6 +194,8 @@ jobs:
         if: steps.db_contract.outputs.run_prisma == 'true'
         run: |
           set -o pipefail
+          git diff --exit-code -- package-lock.json
+          python3 .github/scripts/validate_db_contract.py verify-runtime-versions --repo-root .
           npm run db:validate --workspace=server
           npm run db:migrate:deploy --workspace=server
           npm run db:seed --workspace=server
