@@ -32,10 +32,12 @@ Workflow berjalan pada GitHub-hosted runner `ubuntu-latest` dengan permission ba
 - Menggunakan Node.js `22.x` (selaras dengan `engines.node >=22.0.0` dan Dockerfile) beserta npm cache dari `package-lock.json`.
 - Menjalankan perintah berikut dari root repository:
   1. `npm ci`
-  2. `npm run typecheck`
-  3. `npm run lint`
-  4. `npm run build`
-  5. `npm test`
+  2. `python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v` (self-test validator kontrak CI)
+  3. `python3 .github/scripts/verify_prisma_root_env.py` (`Verify Prisma 7.10.1 root .env discovery` — memverifikasi perilaku runtime CLI `prisma@7.10.1` + `@prisma/client@7.10.1` + `dotenv@16.6.1` membaca root `.env` secara terisolasi di direktori sementara di luar repository, tanpa mengubah `package.json` atau `package-lock.json` proyek)
+  4. `npm run typecheck`
+  5. `npm run lint`
+  6. `npm run build`
+  7. `npm test`
 
 ### Job 2: `Database Integration` (`database-integration`)
 Berjalan setelah `Quality Gate` lulus (paralel dengan `Docker Compose Integration`):
@@ -49,7 +51,7 @@ Berjalan setelah `Quality Gate` lulus (paralel dengan `Docker Compose Integratio
    - **Sebelum `SBS-19` (`server/prisma/schema.prisma`, `server/prisma7.config.ts`, dependency Prisma, dan script DB belum ada pada base maupun PR):** Self-test validator, PostgreSQL readiness, dan `SELECT 1` tetap berjalan dan wajib lulus, sedangkan kontrak `SBS-19` dan eksekusi Prisma dicatat secara eksplisit sebagai tidak berlaku (`N/A`) hingga `SBS-19` dimulai. Jika hanya sebagian artefak `SBS-19` hadir (misalnya config ada tanpa schema, schema ada tanpa config/versi `7.10.1`, atau script/migrasi sebagian), validasi langsung gagal dan tidak turun ke status `N/A`.
    - **Proteksi anti-bypass penghapusan schema:** Pada `pull_request`, `push`, dan `workflow_dispatch`, jika `server/prisma/schema.prisma` sudah ada di base commit tetapi hilang pada head, job langsung gagal dan tidak turun ke mode `N/A`.
    - **Target versi & lockfile (`7.10.1`):** Saat artefak `SBS-19` hadir, `validate_db_contract.py` mewajibkan `server/package.json` mematok `devDependencies.prisma = "7.10.1"` dan `dependencies["@prisma/client"] = "7.10.1"` secara eksak (menolak `8.0.0-rc.*`, Prisma 6, range `^`/`~`, `latest`, dan ketidaksamaan versi), mewajibkan root `package-lock.json` mengunci kedua paket tersebut ke `7.10.1` (baik layout *hoisted* maupun *nested*), menolak `server/package-lock.json` serta override pada root `package.json`, lalu saat `run_prisma == 'true'` memverifikasi `git diff --exit-code -- package-lock.json` dan `verify-runtime-versions` pada `node_modules`.
-   - **Canonical configuration (`server/prisma7.config.ts`) & larangan config aliases:** Satu-satunya file konfigurasi Prisma yang diizinkan adalah file non-symlink `server/prisma7.config.ts` dengan struktur AST kanonis (`schema: "prisma/schema.prisma"`, `migrations: { path: "prisma/migrations" }`, `datasource: { url: process.env["DATABASE_URL"] }`, tanpa komentar, extra import, spread, literal URL, maupun dynamic expression). Seluruh kandidat alias pada root maupun `server/` (`prisma.config.*`, `prisma7.config.*` selain `server/prisma7.config.ts`, `.config/prisma.*`, `.config/prisma7.*`, `.config/prisma.config.*`, `.config/prisma7.config.*`, beserta variasi `/index.*` untuk ekstensi `.js`, `.ts`, `.mjs`, `.cjs`, `.mts`, `.cts`), schema di luar `server/prisma/schema.prisma`, dan blok `"prisma"` pada `package.json` root maupun `server/` ditolak.
+   - **Canonical configuration (`server/prisma7.config.ts`) & larangan config aliases:** Satu-satunya file konfigurasi Prisma yang diizinkan adalah file non-symlink `server/prisma7.config.ts` dengan struktur AST kanonis yang memuat root `.env` secara eksplisit relatif terhadap `import.meta.url` (`dotenv.config({ path: path.resolve(configDirectory, "../.env"), override: false })`), `schema: "prisma/schema.prisma"`, `migrations: { path: "prisma/migrations" }`, dan `datasource: { url: process.env["DATABASE_URL"] }`, tanpa komentar, `import "dotenv/config"`, `process.cwd()`, `server/.env`, `override: true`, extra import, spread, literal URL, maupun dynamic expression. Karena `override: false`, `DATABASE_URL` dari environment proses/CI tetap diprioritaskan di atas root `.env`. Seluruh kandidat alias pada root maupun `server/` (`prisma.config.*`, `prisma7.config.*` selain `server/prisma7.config.ts`, `.config/prisma.*`, `.config/prisma7.*`, `.config/prisma.config.*`, `.config/prisma7.config.*`, beserta variasi `/index.*` untuk ekstensi `.js`, `.ts`, `.mjs`, `.cjs`, `.mts`, `.cts`), schema di luar `server/prisma/schema.prisma`, dan blok `"prisma"` pada `package.json` root maupun `server/` ditolak.
    - **Validasi lokasi kanonis, isi, & immutability migrasi (saat schema tersedia):** `.github/scripts/validate_db_contract.py` mewajibkan `server/prisma/schema.prisma` (non-symlink), `server/prisma/migrations/migration_lock.toml` dengan `provider = "postgresql"`, setiap `<migrasi>/migration.sql` non-symlink tidak kosong dan memuat SQL executable setelah komentar `--` dan `/* ... */` dibuang, serta seluruh `migration.sql` pada commit base tetap identik (*fail-closed* terhadap kegagalan `git rev-parse` / `git ls-tree`). Pada `db:validate` dan `db:migrate:deploy`, flag `--schema=prisma/schema.prisma` wajib dituliskan secara eksplisit; path schema alternatif, traversal `..`, path absolut, dan `--config` ditolak.
    - **Validasi direct local executable, exact token, & allowlist environment:** Setiap script database (`db:validate`, `db:migrate:deploy`, `db:seed`, `test:db`) pada `server/package.json` wajib memanggil direct local executable yang terpasang di `node_modules/.bin` melalui `npm run --workspace=server`. Wrapper `npx`, `npm`, dan `npm exec`, executable/path separator `/` atau `\`, assignment environment generik (`PATH=`, `NODE_PATH=`, `NODE_OPTIONS=`, `HOME=`, `IFS=`, dll.), operator shell chaining/redirection (`;`, `||`, `|`, `&&`, `&`, `>`, `<`, `$()`, backtick), serta flag tak dikenal ditolak. Hanya `NODE_ENV=test` (maksimal satu kali) yang diizinkan khusus pada `test:db`, dan `db:seed` wajib menjalankan tepat `tsx prisma/seed.ts`. Direktori khusus `server/src/__tests__/database/*.test.ts` wajib tersedia dengan minimal satu file test non-empty berisi deklarasi `test(`/`it(` yang dapat dijalankan.
    - **Eksekusi aplikasi & validasi output TAP:** Menjalankan `db:validate`, `db:migrate:deploy`, dan `db:seed` via `--workspace=server`, menjalankan `npm run test:db --workspace=server | tee "$RUNNER_TEMP/sbs-db-tests.tap"`, lalu menjalankan `validate_db_contract.py verify-tap` untuk memastikan ringkasan TAP melaporkan `# tests > 0`, `# pass > 0`, `# fail == 0`, `# cancelled == 0`, dan tidak seluruh test dilewati (`# skipped < # tests`).
@@ -78,10 +80,19 @@ Agar `Database Integration` otomatis mengaktifkan seluruh pemeriksaan Prisma saa
   - `server/package.json` wajib mematok `"prisma": "7.10.1"` pada `devDependencies` dan `"@prisma/client": "7.10.1"` pada `dependencies` (tanpa range `^`/`~`, `latest`, Prisma 8 RC, maupun Prisma 6).
   - Root `package-lock.json` wajib mengunci kedua paket ke `7.10.1`, tidak berubah saat `npm ci`, serta tanpa `server/package-lock.json` terpisah maupun `"prisma"`/`"@prisma/client"` di root `package.json`.
 - **File wajib & canonical config:**
-  - `server/prisma7.config.ts` (non-empty, non-symlink) sesuai template kanonis Prisma 7.10.1:
+  - `server/prisma7.config.ts` (non-empty, non-symlink) sesuai template kanonis Prisma 7.10.1 (memuat `.env` di root repository dengan `override: false`, **bukan** `server/.env`, serta mempertahankan prioritas environment proses/CI):
     ```ts
-    import "dotenv/config";
+    import dotenv from "dotenv";
+    import path from "node:path";
+    import { fileURLToPath } from "node:url";
     import { defineConfig } from "prisma/config";
+
+    const configDirectory = path.dirname(fileURLToPath(import.meta.url));
+
+    dotenv.config({
+      path: path.resolve(configDirectory, "../.env"),
+      override: false,
+    });
 
     export default defineConfig({
       schema: "prisma/schema.prisma",

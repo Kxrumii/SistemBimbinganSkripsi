@@ -23,11 +23,20 @@ Saat **`SBS-19`** (serta Pull Request setelahnya) mengimplementasikan database l
 - **Target versi & lockfile (`7.10.1` stable):**
   - `server/package.json` wajib mematok `devDependencies.prisma = "7.10.1"` dan `dependencies["@prisma/client"] = "7.10.1"` secara eksak (tanpa `^`, `~`, `latest`, Prisma 8 RC, maupun Prisma 6).
   - Root `package-lock.json` wajib mengunci kedua paket ke `7.10.1` (tanpa `server/package-lock.json` terpisah maupun override di root `package.json`), serta `npm ci` tidak boleh mengubah `package-lock.json`.
-- **Canonical Prisma configuration (`server/prisma7.config.ts`) & larangan pengalihan konfigurasi:**
-  - Wajib menyediakan tepat satu file konfigurasi non-symlink pada **`server/prisma7.config.ts`** dengan isi deterministik kanonis:
+- **Canonical Prisma configuration (`server/prisma7.config.ts`) & pemuatan root `.env`:**
+  - Wajib menyediakan tepat satu file konfigurasi non-symlink pada **`server/prisma7.config.ts`** dengan isi deterministik kanonis yang memuat root `.env` (`../.env` relatif terhadap `import.meta.url`) dengan `override: false` agar `DATABASE_URL` dari environment proses/CI tetap diprioritaskan (dan `server/.env` tidak dipakai):
     ```ts
-    import "dotenv/config";
+    import dotenv from "dotenv";
+    import path from "node:path";
+    import { fileURLToPath } from "node:url";
     import { defineConfig } from "prisma/config";
+
+    const configDirectory = path.dirname(fileURLToPath(import.meta.url));
+
+    dotenv.config({
+      path: path.resolve(configDirectory, "../.env"),
+      override: false,
+    });
 
     export default defineConfig({
       schema: "prisma/schema.prisma",
@@ -39,7 +48,7 @@ Saat **`SBS-19`** (serta Pull Request setelahnya) mengimplementasikan database l
       },
     });
     ```
-  - Dilarang membuat file konfigurasi alternatif atau symlink pada root repository maupun `server/` (`prisma.config.*`, `prisma7.config.*` selain `server/prisma7.config.ts`, `.config/prisma.*`, `.config/prisma7.*`, `.config/prisma.config.*`, maupun variasi `/index.*` untuk ekstensi `.js`, `.ts`, `.mjs`, `.cjs`, `.mts`, `.cts`), schema liar di luar `server/prisma/schema.prisma`, serta blok `"prisma"` pada root `package.json` maupun `server/package.json`.
+  - Dilarang membuat `.env` di dalam `server/`, menggunakan `import "dotenv/config"`, `process.cwd()`, atau `DOTENV_PATH`, membuat file konfigurasi alternatif atau symlink pada root repository maupun `server/` (`prisma.config.*`, `prisma7.config.*` selain `server/prisma7.config.ts`, `.config/prisma.*`, `.config/prisma7.*`, `.config/prisma.config.*`, maupun variasi `/index.*` untuk ekstensi `.js`, `.ts`, `.mjs`, `.cjs`, `.mts`, `.cts`), schema liar di luar `server/prisma/schema.prisma`, serta blok `"prisma"` pada root `package.json` maupun `server/package.json`. File `.env` lokal tidak pernah di-commit ke Git.
 - **Artefak & lokasi kanonis pada `server/`:**
   - `server/prisma/schema.prisma` (non-empty, non-symlink); `db:validate` dan `db:migrate:deploy` wajib menuliskan eksplisit `--schema=prisma/schema.prisma` (atau `--schema prisma/schema.prisma`), tanpa `--config`, duplikasi `--schema`, traversal `..`, atau path absolut.
   - `server/prisma/migrations/migration_lock.toml` dengan `provider = "postgresql"`

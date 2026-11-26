@@ -61,6 +61,7 @@ flowchart LR
    - `WEB_BIND_ADDRESS`: pertahankan `127.0.0.1`.
    - `CLIENT_ORIGIN`: `http://localhost:5173` untuk Mode A, atau `http://127.0.0.1:8080` (atau origin HTTPS domain target) untuk Mode B.
 4. Pastikan `.env` tidak dilacak Git (`git status --short`) dan tetap masuk `.dockerignore`.
+5. Repository menggunakan satu file `.env` di root saja (**jangan** membuat `server/.env`); `server/prisma7.config.ts` memuat root `.env` secara eksplisit dengan `override: false`, sehingga variabel environment proses/CI tetap diprioritaskan di atas `.env` lokal.
 
 ---
 

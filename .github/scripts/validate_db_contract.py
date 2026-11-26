@@ -385,7 +385,7 @@ def _tokenize_canonical_ts_config(source: str) -> tuple[list[tuple[str, str]], s
     tokens: list[tuple[str, str]] = []
     i = 0
     n = len(source)
-    punct = set("{}()[]:,;.")
+    punct = set("{}()[]:,;.=")
 
     while i < n:
         ch = source[i]
@@ -459,28 +459,77 @@ class _CanonicalConfigParser:
         return False
 
     def parse(self) -> None:
-        # Statement 1: import "dotenv/config";
+        # Statement 1: import dotenv from "dotenv";
         self.consume("IDENT", "import")
-        _, dotenv_spec = self.consume("STRING")
-        if dotenv_spec != "dotenv/config":
-            raise ValueError(f"First import must be 'dotenv/config' (got: {dotenv_spec!r})")
+        self.consume("IDENT", "dotenv")
+        self.consume("IDENT", "from")
+        _, dotenv_pkg = self.consume("STRING")
+        if dotenv_pkg != "dotenv":
+            raise ValueError(f"dotenv import must come strictly from 'dotenv' (got: {dotenv_pkg!r})")
         self.optional_punct(";")
 
-        # Statement 2: import { defineConfig } from "prisma/config";
+        # Statement 2: import path from "node:path";
+        self.consume("IDENT", "import")
+        self.consume("IDENT", "path")
+        self.consume("IDENT", "from")
+        _, path_pkg = self.consume("STRING")
+        if path_pkg != "node:path":
+            raise ValueError(f"path import must come strictly from 'node:path' (got: {path_pkg!r})")
+        self.optional_punct(";")
+
+        # Statement 3: import { fileURLToPath } from "node:url";
         self.consume("IDENT", "import")
         self.consume("PUNCT", "{")
-        _, fn_name = self.consume("IDENT")
-        if fn_name != "defineConfig":
-            raise ValueError(f"Must import 'defineConfig' from 'prisma/config' (got: {fn_name!r})")
+        self.consume("IDENT", "fileURLToPath")
+        self.optional_punct(",")
+        self.consume("PUNCT", "}")
+        self.consume("IDENT", "from")
+        _, url_pkg = self.consume("STRING")
+        if url_pkg != "node:url":
+            raise ValueError(f"fileURLToPath import must come strictly from 'node:url' (got: {url_pkg!r})")
+        self.optional_punct(";")
+
+        # Statement 4: import { defineConfig } from "prisma/config";
+        self.consume("IDENT", "import")
+        self.consume("PUNCT", "{")
+        self.consume("IDENT", "defineConfig")
         self.optional_punct(",")
         self.consume("PUNCT", "}")
         self.consume("IDENT", "from")
         _, cfg_pkg = self.consume("STRING")
         if cfg_pkg != "prisma/config":
-            raise ValueError(f"Second import must come strictly from 'prisma/config' (got: {cfg_pkg!r})")
+            raise ValueError(f"defineConfig import must come strictly from 'prisma/config' (got: {cfg_pkg!r})")
         self.optional_punct(";")
 
-        # Statement 3: export default defineConfig({ ... });
+        # Statement 5: const configDirectory = path.dirname(fileURLToPath(import.meta.url));
+        self.consume("IDENT", "const")
+        self.consume("IDENT", "configDirectory")
+        self.consume("PUNCT", "=")
+        self.consume("IDENT", "path")
+        self.consume("PUNCT", ".")
+        self.consume("IDENT", "dirname")
+        self.consume("PUNCT", "(")
+        self.consume("IDENT", "fileURLToPath")
+        self.consume("PUNCT", "(")
+        self.consume("IDENT", "import")
+        self.consume("PUNCT", ".")
+        self.consume("IDENT", "meta")
+        self.consume("PUNCT", ".")
+        self.consume("IDENT", "url")
+        self.consume("PUNCT", ")")
+        self.consume("PUNCT", ")")
+        self.optional_punct(";")
+
+        # Statement 6: dotenv.config({ path: path.resolve(configDirectory, "../.env"), override: false });
+        self.consume("IDENT", "dotenv")
+        self.consume("PUNCT", ".")
+        self.consume("IDENT", "config")
+        self.consume("PUNCT", "(")
+        self._parse_dotenv_config_object()
+        self.consume("PUNCT", ")")
+        self.optional_punct(";")
+
+        # Statement 7: export default defineConfig({ ... });
         self.consume("IDENT", "export")
         self.consume("IDENT", "default")
         self.consume("IDENT", "defineConfig")
@@ -492,6 +541,51 @@ class _CanonicalConfigParser:
         if self.peek() is not None:
             extra = self.peek()
             raise ValueError(f"Unexpected extra statement or token {extra[1]!r} after defineConfig(...)")
+
+    def _parse_dotenv_config_object(self) -> None:
+        self.consume("PUNCT", "{")
+        seen_keys: set[str] = set()
+        expected_keys = {"path", "override"}
+
+        while self.peek() != ("PUNCT", "}"):
+            _, key = self.consume("IDENT")
+            if key not in expected_keys:
+                raise ValueError(f"Unsupported key {key!r} in dotenv.config options")
+            if key in seen_keys:
+                raise ValueError(f"Duplicate key {key!r} in dotenv.config options")
+            seen_keys.add(key)
+            self.consume("PUNCT", ":")
+
+            if key == "path":
+                self.consume("IDENT", "path")
+                self.consume("PUNCT", ".")
+                self.consume("IDENT", "resolve")
+                self.consume("PUNCT", "(")
+                self.consume("IDENT", "configDirectory")
+                self.consume("PUNCT", ",")
+                _, env_rel = self.consume("STRING")
+                if env_rel != "../.env":
+                    raise ValueError(
+                        f"dotenv path must strictly resolve '../.env' relative to configDirectory (got: {env_rel!r})"
+                    )
+                self.consume("PUNCT", ")")
+            elif key == "override":
+                _, override_val = self.consume("IDENT")
+                if override_val != "false":
+                    raise ValueError(
+                        f"dotenv.config override must strictly equal boolean false (got: {override_val!r})"
+                    )
+
+            if self.peek() == ("PUNCT", ","):
+                self.consume("PUNCT", ",")
+            elif self.peek() != ("PUNCT", "}"):
+                tok = self.peek()
+                raise ValueError(f"Expected ',' or '}}' in dotenv.config options, got {tok[1]!r}")
+
+        self.consume("PUNCT", "}")
+        missing = sorted(expected_keys - seen_keys)
+        if missing:
+            raise ValueError(f"Missing required key(s) in dotenv.config options: {missing}")
 
     def _parse_root_object(self) -> None:
         self.consume("PUNCT", "{")

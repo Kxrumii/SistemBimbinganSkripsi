@@ -39,6 +39,9 @@ jobs:
         id: validator_tests
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
+      - name: Verify Prisma 7.10.1 root .env discovery
+        run: python3 .github/scripts/verify_prisma_root_env.py
+
       - name: Typecheck workspaces
         run: npm run typecheck
 

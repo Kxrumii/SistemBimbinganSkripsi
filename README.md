@@ -45,8 +45,11 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 SistemBimbinganSkripsi/
 ├── .github/
 │   ├── pull_request_template.md       # Template Pull Request
+│   ├── fixtures/
+│   │   └── prisma7.config.ts          # Fixture canonical config Prisma 7.10.1
 │   ├── scripts/
 │   │   ├── validate_db_contract.py    # Validator kontrak SBS-19 & output TAP
+│   │   ├── verify_prisma_root_env.py  # Uji runtime root .env pada fixture sementara
 │   │   └── test_validate_db_contract.py
 │   └── workflows/
 │       └── ci.yml                     # GitHub Actions CI (3 job checks)
@@ -155,7 +158,7 @@ npm ci
    - `POSTGRES_PASSWORD`
    - segmen password pada `DATABASE_URL` (`postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>?schema=public`)
 
-> Jangan pernah meng-commit `.env` atau credential asli ke repository Git.
+> Jangan pernah meng-commit `.env` atau credential asli ke repository Git. File `.env` hanya disimpan di root repository (tidak membuat `server/.env`); konfigurasi Prisma `server/prisma7.config.ts` pada `SBS-19` memuat root `.env` secara eksplisit dengan `override: false`, sehingga variabel environment proses/CI tetap diprioritaskan.
 
 ---
 
@@ -228,7 +231,7 @@ Perintah per workspace:
 
 ## 7. Continuous Integration (GitHub Actions)
 
-Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan tiga job: **`Quality Gate`** (typecheck, lint, build, dan unit tests Node.js `22.x`), kemudian **`Database Integration`** (PostgreSQL Mode A `127.0.0.1:5432`, proteksi anti-hapus schema, penguncian versi Prisma `7.10.1` & canonical `server/prisma7.config.ts`, serta gate kondisional `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` mulai `SBS-19`) bersama **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume) secara paralel.
+Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan tiga job: **`Quality Gate`** (self-test validator, uji runtime fixture sementara Prisma `7.10.1` untuk pemuatan root `.env`, typecheck, lint, build, dan unit tests Node.js `22.x`), kemudian **`Database Integration`** (PostgreSQL Mode A `127.0.0.1:5432`, proteksi anti-hapus schema, penguncian versi Prisma `7.10.1` & canonical `server/prisma7.config.ts`, serta gate kondisional `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` mulai `SBS-19`) bersama **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume) secara paralel.
 
 Workflow ini tidak melakukan deployment ke server atau publish image ke container registry. Penjelasan detail kontrak database, batas baseline sebelum `SBS-19`, dan panduan troubleshooting tersedia pada [Dokumentasi CI](docs/ci.md) serta [Panduan Pengujian](docs/testing.md).
 

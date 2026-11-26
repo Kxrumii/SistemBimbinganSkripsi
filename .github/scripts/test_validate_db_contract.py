@@ -22,19 +22,8 @@ if str(SCRIPT_DIR) not in sys.path:
 import validate_db_contract as v  # noqa: E402
 
 
-CANONICAL_CONFIG_CONTENT = """import "dotenv/config";
-import { defineConfig } from "prisma/config";
-
-export default defineConfig({
-  schema: "prisma/schema.prisma",
-  migrations: {
-    path: "prisma/migrations",
-  },
-  datasource: {
-    url: process.env["DATABASE_URL"],
-  },
-});
-"""
+FIXTURE_CONFIG_PATH = SCRIPT_DIR.parent / "fixtures/prisma7.config.ts"
+CANONICAL_CONFIG_CONTENT = FIXTURE_CONFIG_PATH.read_text(encoding="utf-8")
 
 VALID_SCRIPTS = {
     "db:validate": "prisma validate --schema=prisma/schema.prisma",
@@ -651,8 +640,21 @@ class VersionAndLockfileTests(TempRepoTestCase):
 
 class CanonicalConfigTests(TempRepoTestCase):
     def test_accepts_canonical_config_and_safe_formatting_variants(self) -> None:
-        single_quote_variant = """import 'dotenv/config'
+        self.write_valid_sbs19_contract(config_content=CANONICAL_CONFIG_CONTENT)
+        code, _, logs = self.run_check()
+        self.assertEqual(code, 0, msg=logs)
+
+        single_quote_variant = """import dotenv from 'dotenv'
+import path from 'node:path'
+import { fileURLToPath, } from 'node:url'
 import { defineConfig, } from 'prisma/config'
+
+const configDirectory = path.dirname(fileURLToPath(import.meta.url))
+
+dotenv.config({
+  override: false,
+  path: path.resolve(configDirectory, '../.env'),
+})
 
 export default defineConfig({
   datasource: {
@@ -668,16 +670,97 @@ export default defineConfig({
         code, _, logs = self.run_check()
         self.assertEqual(code, 0, msg=logs)
 
-    def test_rejects_modified_or_dynamic_canonical_config_contents(self) -> None:
+    def test_fixture_file_does_not_trigger_partial_sbs19_or_forbidden_config(self) -> None:
+        self.write_file(
+            "server/package.json",
+            json.dumps({"scripts": {"test": "tsx --test src/__tests__/*.test.ts"}}),
+        )
+        self.write_file(".github/fixtures/prisma7.config.ts", CANONICAL_CONFIG_CONTENT)
+        self.assertEqual(v.detect_partial_sbs19_artifacts(str(self.root)), [])
+        code, gh_out, logs = self.run_check()
+        self.assertEqual(code, 0, msg=logs)
+        self.assertIn("run_prisma=false", gh_out)
+
+    def test_rejects_wrong_root_env_resolution_override_and_dynamic_config(self) -> None:
+        old_dotenv_import_cfg = """import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: {
+    path: "prisma/migrations",
+  },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+  },
+});
+"""
         bad_configs = [
             "",
+            old_dotenv_import_cfg,
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path: path.resolve(configDirectory, "../.env"),\n  override: false,',
+                "",
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                '"../.env"',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                '".env"',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(process.cwd(), "../.env")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(configDirectory, "./.env")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(configDirectory, "../../.env")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(configDirectory, "server/.env")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(configDirectory, "../.env.local")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'path.resolve(configDirectory, "../.env.production")',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'process.env["DOTENV_PATH"]',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path.resolve(configDirectory, "../.env")',
+                'process.env["DOTENV_CONFIG_PATH"]',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace("override: false", "override: true"),
+            CANONICAL_CONFIG_CONTENT.replace("  override: false,\n", ""),
+            CANONICAL_CONFIG_CONTENT.replace(
+                "override: false,",
+                "override: false,\n  override: false,",
+            ),
+            CANONICAL_CONFIG_CONTENT.replace(
+                'path: path.resolve(configDirectory, "../.env"),',
+                'path: path.resolve(configDirectory, "../.env"),\n  path: path.resolve(configDirectory, "../.env"),',
+            ),
+            CANONICAL_CONFIG_CONTENT.replace("  override: false,", "...extraDotenvOpts,\n  override: false,"),
+            CANONICAL_CONFIG_CONTENT.replace("override: false,", '["override"]: false,'),
             CANONICAL_CONFIG_CONTENT.replace('"prisma/schema.prisma"', '"prisma/alt.prisma"'),
             CANONICAL_CONFIG_CONTENT.replace('"prisma/migrations"', '"prisma/alt_migrations"'),
             CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', '"postgresql://user:pass@localhost/db"'),
             CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'process.env["CUSTOM_DB_URL"]'),
             CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'env("DATABASE_URL")'),
             CANONICAL_CONFIG_CONTENT.replace('process.env["DATABASE_URL"]', 'process.env["DATABASE_URL"] || ""'),
-            'import "dotenv/config";\nimport { readFileSync } from "node:fs";\n' + CANONICAL_CONFIG_CONTENT.split("\n", 1)[1],
+            'import { readFileSync } from "node:fs";\n' + CANONICAL_CONFIG_CONTENT,
             CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', '...baseConfig,\n  schema: "prisma/schema.prisma",'),
             CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', '["schema"]: "prisma/schema.prisma",'),
             CANONICAL_CONFIG_CONTENT.replace('schema: "prisma/schema.prisma",', 'schema: true ? "prisma/schema.prisma" : "other.prisma",'),
