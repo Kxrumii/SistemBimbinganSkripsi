@@ -116,16 +116,16 @@ SistemBimbinganSkripsi/
 
 Setiap Issue dikerjakan pada remote branch yang sudah disiapkan oleh Project Owner. **Jangan** membuat branch baru secara manual menggunakan `git switch -c`.
 
-Contoh untuk `SBS-04` (`#4`):
+Contoh checkout untuk branch Issue yang belum di-merge (ganti dengan branch Issue terkait, misalnya `issue/5-authentication-rbac` untuk `#5`):
 
 ```bash
 git clone https://github.com/Kxrumii/SistemBimbinganSkripsi.git
 cd SistemBimbinganSkripsi
 git fetch origin
-git switch --track origin/issue/4-app-foundation-docker
+git switch --track origin/issue/<nomor-issue>-<slug>
 ```
 
-Untuk Issue lain, ganti `issue/4-app-foundation-docker` dengan nama branch Issue terkait (misalnya `issue/5-authentication-rbac` untuk `#5`). Jika branch tersebut belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
+Jika branch Issue tersebut belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
 
 ---
 

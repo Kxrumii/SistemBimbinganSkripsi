@@ -26,13 +26,13 @@ Saat **`SBS-19`** (serta Pull Request setelahnya) menambahkan schema Prisma, rep
   - Minimal satu `server/prisma/migrations/<nama_migrasi>/migration.sql` yang valid, non-empty, dan berisi SQL executable (bukan komentar atau `;` saja)
   - `server/prisma/seed.ts` (non-empty)
   - Direktori test khusus database `server/src/__tests__/database/*.test.ts` berisi minimal satu file test non-empty yang benar-benar dapat dijalankan
-- **Script wajib pada `server/package.json` (divalidasi secara semantik; bukan placeholder seperti `echo`, `exit 0`, `true`, `:`, atau pemanggilan unit test generik):**
+- **Script wajib pada `server/package.json` (harus satu direct command dengan grammar eksplisit *fail-closed*; menolak `;`, `||`, `|`, `&&`, `&`, redirection, `$()`, backtick, placeholder, atau unit test generik):**
   1. `db:validate` — menjalankan `prisma validate`
   2. `db:migrate:deploy` — menjalankan `prisma migrate deploy`
   3. `db:seed` — menjalankan seed sintetis (`prisma db seed` atau runner JS/TS ke `prisma/seed.ts`)
   4. `test:db` — menjalankan database test directory memakai runner test bawaan dengan output TAP, misalnya:
      `node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts`
-- **Ketentuan immutability & verifikasi hasil test:**
-  - Migration SQL yang sudah ada pada base branch (`main`) bersifat immutable (tidak boleh dihapus, diubah, atau diganti nama pada Pull Request berikutnya); penambahan migrasi baru dilakukan melalui direktori migrasi baru.
+- **Ketentuan immutability & batas verifikasi test:**
+  - Migration SQL yang sudah ada pada base branch (`main`) bersifat immutable (tidak boleh dihapus, diubah, atau diganti nama pada Pull Request berikutnya), dan kegagalan inspeksi `git ls-tree` akan langsung menggagalkan CI (*fail-closed*). Penambahan migrasi baru dilakukan melalui direktori migrasi baru.
   - Setelah `server/prisma/schema.prisma` tersedia di `main`, Pull Request yang menghapus file tersebut otomatis digagalkan.
-  - Output TAP dari `test:db` diperiksa oleh CI untuk memastikan minimal satu test berjalan dan lulus (`# tests > 0`, `# pass > 0`, `# fail == 0`, serta tidak seluruh test berstatus skip). Detail lengkap dijelaskan pada [`docs/ci.md`](../docs/ci.md).
+  - Output TAP dari `test:db` diperiksa oleh CI untuk memastikan minimal satu test berjalan dan lulus (`# tests > 0`, `# pass > 0`, `# fail == 0`, serta tidak seluruh test berstatus skip). Karena CI tidak memverifikasi isi AST setiap test apakah benar-benar memanggil Prisma/PostgreSQL, reviewer pada `SBS-19` wajib meninjau bahwa test menjalankan operasi database nyata, bukan mock-only atau assertion statis. Detail lengkap dijelaskan pada [`docs/ci.md`](../docs/ci.md).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI validator for SBS-19 Prisma schema, migration, script contract, and TAP results."""
+"""Fail-closed CI validator for SBS-19 Prisma schema, migrations, script contract, and TAP output."""
 
 from __future__ import annotations
 
@@ -15,15 +15,22 @@ import sys
 from typing import Iterable
 
 
-PLACEHOLDER_COMMANDS = {"true", ":", "echo", "printf"}
-WRAPPER_EXECUTABLES = {"npx", "pnpx", "bunx"}
-JS_RUNNERS = {"node", "tsx", "ts-node", "bun"}
+FORBIDDEN_SHELL_RE = re.compile(r"[;|&><`$(){}\\\n\r\0]")
+STATIC_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:-]+$")
+SAFE_SCHEMA_PATH_RE = re.compile(r"^(?:\./)?[A-Za-z0-9_./-]+\.prisma$")
+SAFE_SEED_PATH_RE = re.compile(r"^(?:\./)?(?:prisma/)?seed\.[cm]?[jt]s$")
+SAFE_DB_TEST_PATH_RE = re.compile(
+    r"^(?:\./)?src/__tests__/database(?:/|/(?:\*|[A-Za-z0-9_.-]+)\.test\.ts)?$"
+)
 COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 SQL_LINE_COMMENT_RE = re.compile(r"--[^\r\n]*")
 JS_LINE_COMMENT_RE = re.compile(r"//[^\r\n]*")
 RUNNABLE_TEST_RE = re.compile(r"(?<![.\w])(?:test|it)\s*\(")
 LOCK_PROVIDER_RE = re.compile(r"""^\s*provider\s*=\s*(["'])([^"']+)\1\s*$""")
-ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+
+class GitInspectionError(RuntimeError):
+    """Raised when inspecting base Git state fails."""
 
 
 def run_git(repo_root: str, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -74,26 +81,43 @@ def resolve_base_ref(
 def get_base_migrations(repo_root: str, base_ref: str | None) -> dict[str, str]:
     if not base_ref:
         return {}
-    res = run_git(
-        repo_root,
-        ["ls-tree", "-r", "--full-tree", base_ref, "--", "server/prisma/migrations"],
-    )
+    try:
+        res = run_git(
+            repo_root,
+            ["ls-tree", "-r", "--full-tree", base_ref, "--", "server/prisma/migrations"],
+        )
+    except OSError as exc:
+        raise GitInspectionError(
+            "Failed to execute git ls-tree while inspecting base migrations."
+        ) from exc
+
     if res.returncode != 0:
-        return {}
+        raise GitInspectionError(
+            f"git ls-tree failed while inspecting base migrations (exit code {res.returncode})."
+        )
+
     migrations: dict[str, str] = {}
     for line in res.stdout.splitlines():
-        if not line.strip() or "\t" not in line:
+        if not line.strip():
             continue
+        if "\t" not in line:
+            raise GitInspectionError("Unexpected output format from git ls-tree while inspecting base migrations.")
         meta, rel_path = line.split("\t", 1)
         parts = meta.split()
-        if len(parts) >= 3 and parts[1] == "blob" and rel_path.endswith("/migration.sql"):
+        if len(parts) < 3:
+            raise GitInspectionError("Malformed git ls-tree entry while inspecting base migrations.")
+        if parts[1] == "blob" and rel_path.endswith("/migration.sql"):
             migrations[rel_path] = parts[2]
     return migrations
 
 
 def check_migration_immutability(repo_root: str, base_ref: str | None) -> list[str]:
+    try:
+        base_migrations = get_base_migrations(repo_root, base_ref)
+    except GitInspectionError as exc:
+        return [str(exc)]
+
     errors: list[str] = []
-    base_migrations = get_base_migrations(repo_root, base_ref)
     for rel_path, expected_sha in sorted(base_migrations.items()):
         abs_path = os.path.join(repo_root, rel_path)
         if not os.path.isfile(abs_path):
@@ -112,8 +136,7 @@ def check_migration_immutability(repo_root: str, base_ref: str | None) -> list[s
 
 def strip_sql_comments(sql_text: str) -> str:
     no_block = COMMENT_BLOCK_RE.sub(" ", sql_text)
-    no_line = SQL_LINE_COMMENT_RE.sub(" ", no_block)
-    return no_line
+    return SQL_LINE_COMMENT_RE.sub(" ", no_block)
 
 
 def has_executable_sql(sql_text: str) -> bool:
@@ -215,72 +238,218 @@ def validate_database_test_files(repo_root: str) -> tuple[list[str], int]:
     return errors, runnable_files
 
 
-def split_shell_chain(command: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
-    """Split a shell command string on &&, ||, ; outside quotes."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-    lexer.whitespace_split = True
-    tokens = list(lexer)
+def parse_single_direct_command(script_name: str, raw_cmd: object) -> tuple[str | None, list[str], str | None]:
+    """Parse one direct executable command without shell chaining or unsafe syntax."""
+    if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+        return None, [], f"server/package.json scripts.{script_name} is missing or empty"
 
-    segments: list[tuple[str, list[str]]] = []
-    errors: list[str] = []
-    current: list[str] = []
-    prev_op = ""
+    if FORBIDDEN_SHELL_RE.search(raw_cmd):
+        return (
+            None,
+            [],
+            f"server/package.json scripts.{script_name} contains disallowed shell chaining, redirection, or substitution syntax",
+        )
+
+    try:
+        tokens = shlex.split(raw_cmd, posix=True)
+    except ValueError as exc:
+        return None, [], f"server/package.json scripts.{script_name} cannot be parsed: {exc}"
+
+    if not tokens:
+        return None, [], f"server/package.json scripts.{script_name} is empty"
 
     for tok in tokens:
-        if tok in {"&&", ";", "||"}:
-            if not current:
-                errors.append(f"Invalid empty command segment near operator '{tok}'")
-            else:
-                segments.append((prev_op, current))
-                current = []
-            prev_op = tok
-        else:
-            current.append(tok)
+        if tok.startswith("~"):
+            return (
+                None,
+                [],
+                f"server/package.json scripts.{script_name} contains disallowed home-directory expansion",
+            )
 
-    if current:
-        segments.append((prev_op, current))
-    elif tokens:
-        errors.append("Script command ends with a dangling shell operator")
-
-    return segments, errors
-
-
-def unwrap_command(tokens: list[str]) -> tuple[str, list[str]]:
     idx = 0
-    while idx < len(tokens) and ENV_ASSIGN_RE.match(tokens[idx]):
+    while idx < len(tokens) and STATIC_ENV_RE.match(tokens[idx]):
         idx += 1
+
     if idx >= len(tokens):
-        return "", []
+        return None, [], f"server/package.json scripts.{script_name} contains only environment assignments without a command"
 
-    cmd = os.path.basename(tokens[idx])
-    rest = tokens[idx + 1 :]
+    remaining = tokens[idx:]
+    first = os.path.basename(remaining[0])
 
-    if cmd in WRAPPER_EXECUTABLES:
-        j = 0
-        while j < len(rest) and rest[j].startswith("-"):
-            j += 1
-        if j < len(rest):
-            return os.path.basename(rest[j]), rest[j + 1 :]
-        return cmd, rest
+    if first == "npx":
+        rest = remaining[1:]
+        if rest and rest[0] == "--no-install":
+            rest = rest[1:]
+        if not rest or rest[0].startswith("-"):
+            return (
+                None,
+                [],
+                f"server/package.json scripts.{script_name} uses unsupported npx flags or missing executable",
+            )
+        return os.path.basename(rest[0]), rest[1:], None
 
-    if cmd in {"npm", "pnpm"} and rest and rest[0] == "exec":
-        args_after = [a for a in rest[1:] if a != "--"]
-        j = 0
-        while j < len(args_after) and args_after[j].startswith("-"):
-            j += 1
-        if j < len(args_after):
-            return os.path.basename(args_after[j]), args_after[j + 1 :]
+    if first == "npm":
+        if len(remaining) >= 4 and remaining[1] == "exec" and remaining[2] == "--":
+            sub_exe = os.path.basename(remaining[3])
+            if not sub_exe.startswith("-"):
+                return sub_exe, remaining[4:], None
+        return (
+            None,
+            [],
+            f"server/package.json scripts.{script_name} uses unsupported npm invocation; use a direct command or 'npm exec -- <cmd>'",
+        )
 
-    return cmd, rest
+    return first, remaining[1:], None
 
 
-def has_tap_reporter(args: list[str]) -> bool:
-    for idx, arg in enumerate(args):
-        if arg == "--test-reporter=tap":
-            return True
-        if arg == "--test-reporter" and idx + 1 < len(args) and args[idx + 1] == "tap":
-            return True
-    return False
+def consume_optional_prisma_schema_flag(args: list[str]) -> tuple[list[str], str | None]:
+    """Strip at most one valid --schema flag from prisma arguments."""
+    out: list[str] = []
+    seen_schema = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--schema="):
+            if seen_schema:
+                return [], "Duplicate --schema flag is not allowed"
+            val = arg.split("=", 1)[1]
+            if not SAFE_SCHEMA_PATH_RE.match(val) or ".." in val.split("/"):
+                return [], f"Invalid --schema path: {val}"
+            seen_schema = True
+            i += 1
+        elif arg == "--schema":
+            if seen_schema or i + 1 >= len(args):
+                return [], "Invalid or duplicate --schema option"
+            val = args[i + 1]
+            if not SAFE_SCHEMA_PATH_RE.match(val) or ".." in val.split("/"):
+                return [], f"Invalid --schema path: {val}"
+            seen_schema = True
+            i += 2
+        else:
+            out.append(arg)
+            i += 1
+    return out, None
+
+
+def validate_db_validate_script(exe: str, args: list[str]) -> str | None:
+    if exe != "prisma":
+        return "server/package.json scripts.db:validate must directly invoke 'prisma validate'"
+    core_args, err = consume_optional_prisma_schema_flag(args)
+    if err:
+        return f"server/package.json scripts.db:validate: {err}"
+    if core_args != ["validate"]:
+        return "server/package.json scripts.db:validate must strictly run 'prisma validate' without extra commands or flags"
+    return None
+
+
+def validate_db_migrate_deploy_script(exe: str, args: list[str]) -> str | None:
+    if exe != "prisma":
+        return "server/package.json scripts.db:migrate:deploy must directly invoke 'prisma migrate deploy'"
+    core_args, err = consume_optional_prisma_schema_flag(args)
+    if err:
+        return f"server/package.json scripts.db:migrate:deploy: {err}"
+    if core_args != ["migrate", "deploy"]:
+        return "server/package.json scripts.db:migrate:deploy must strictly run 'prisma migrate deploy' without extra commands or flags"
+    return None
+
+
+def validate_db_seed_script(exe: str, args: list[str]) -> str | None:
+    if exe == "prisma":
+        core_args, err = consume_optional_prisma_schema_flag(args)
+        if err:
+            return f"server/package.json scripts.db:seed: {err}"
+        if core_args == ["db", "seed"]:
+            return None
+        return "server/package.json scripts.db:seed using prisma must strictly run 'prisma db seed'"
+
+    if exe == "tsx":
+        if len(args) == 1 and SAFE_SEED_PATH_RE.match(args[0]):
+            return None
+        return "server/package.json scripts.db:seed using tsx must strictly target prisma/seed.ts or seed.ts"
+
+    if exe == "node":
+        idx = 0
+        if idx < len(args):
+            if args[idx] == "--import=tsx":
+                idx += 1
+            elif args[idx] == "--import" and idx + 1 < len(args) and args[idx + 1] == "tsx":
+                idx += 2
+        remaining = args[idx:]
+        if len(remaining) == 1 and SAFE_SEED_PATH_RE.match(remaining[0]):
+            return None
+        return "server/package.json scripts.db:seed using node must strictly target a seed file without extra commands or flags"
+
+    return "server/package.json scripts.db:seed must directly invoke 'prisma db seed' or execute prisma/seed.ts via tsx/node"
+
+
+def validate_test_db_script(exe: str, args: list[str]) -> str | None:
+    if exe not in {"node", "tsx"}:
+        return (
+            "server/package.json scripts.test:db must directly invoke 'node --import tsx --test --test-reporter=tap src/__tests__/database/*.test.ts' "
+            "or 'tsx --test --test-reporter=tap src/__tests__/database/*.test.ts'"
+        )
+
+    saw_tsx_import = exe == "tsx"
+    saw_test_flag = False
+    saw_tap_reporter = False
+    targets: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if exe == "node" and arg == "--import=tsx":
+            if saw_tsx_import:
+                return "server/package.json scripts.test:db: duplicate --import=tsx"
+            saw_tsx_import = True
+            i += 1
+        elif exe == "node" and arg == "--import":
+            if saw_tsx_import or i + 1 >= len(args) or args[i + 1] != "tsx":
+                return "server/package.json scripts.test:db: --import must strictly specify 'tsx'"
+            saw_tsx_import = True
+            i += 2
+        elif arg == "--test":
+            saw_test_flag = True
+            i += 1
+        elif arg == "--test-reporter=tap":
+            if saw_tap_reporter:
+                return "server/package.json scripts.test:db: duplicate --test-reporter"
+            saw_tap_reporter = True
+            i += 1
+        elif arg == "--test-reporter":
+            if saw_tap_reporter or i + 1 >= len(args) or args[i + 1] != "tap":
+                return "server/package.json scripts.test:db: --test-reporter must strictly be 'tap'"
+            saw_tap_reporter = True
+            i += 2
+        elif arg.startswith("-"):
+            return f"server/package.json scripts.test:db uses unsupported option '{arg}'"
+        else:
+            targets.append(arg)
+            i += 1
+
+    if not saw_tsx_import:
+        return "server/package.json scripts.test:db must include '--import tsx' when invoking node"
+    if not saw_test_flag:
+        return "server/package.json scripts.test:db must include '--test'"
+    if not saw_tap_reporter:
+        return "server/package.json scripts.test:db must include '--test-reporter=tap'"
+    if not targets:
+        return "server/package.json scripts.test:db must explicitly target src/__tests__/database/*.test.ts"
+
+    for target in targets:
+        if not SAFE_DB_TEST_PATH_RE.match(target):
+            return (
+                f"server/package.json scripts.test:db target '{target}' must point strictly to src/__tests__/database/"
+            )
+
+    return None
+
+
+SCRIPT_VALIDATORS = {
+    "db:validate": validate_db_validate_script,
+    "db:migrate:deploy": validate_db_migrate_deploy_script,
+    "db:seed": validate_db_seed_script,
+    "test:db": validate_test_db_script,
+}
 
 
 def validate_scripts(repo_root: str) -> list[str]:
@@ -292,99 +461,15 @@ def validate_scripts(repo_root: str) -> list[str]:
     with open(pkg_path, encoding="utf-8") as fh:
         scripts = json.load(fh).get("scripts") or {}
 
-    required = ("db:validate", "db:migrate:deploy", "db:seed", "test:db")
-    for name in required:
-        raw_cmd = scripts.get(name)
-        if not isinstance(raw_cmd, str) or not raw_cmd.strip():
-            errors.append(f"server/package.json scripts.{name} is missing or empty")
+    for name, validator in SCRIPT_VALIDATORS.items():
+        exe, args, parse_err = parse_single_direct_command(name, scripts.get(name))
+        if parse_err:
+            errors.append(parse_err)
             continue
-
-        try:
-            segments, parse_errors = split_shell_chain(raw_cmd)
-        except ValueError as exc:
-            errors.append(f"server/package.json scripts.{name} cannot be parsed: {exc}")
-            continue
-
-        if parse_errors:
-            errors.extend(f"server/package.json scripts.{name}: {e}" for e in parse_errors)
-            continue
-
-        semantic_match = False
-        blocked_script = False
-
-        for prev_op, tokens in segments:
-            exe, args = unwrap_command(tokens)
-            if not exe:
-                errors.append(f"server/package.json scripts.{name} contains an empty command")
-                blocked_script = True
-                continue
-
-            if prev_op == "||" and (
-                exe in PLACEHOLDER_COMMANDS
-                or (exe == "exit" and (not args or args[0] == "0"))
-            ):
-                errors.append(
-                    f"server/package.json scripts.{name} masks failures with '|| {exe}'"
-                )
-                blocked_script = True
-                continue
-
-            if exe in PLACEHOLDER_COMMANDS or (exe == "exit"):
-                errors.append(
-                    f"server/package.json scripts.{name} uses disallowed placeholder command '{exe}'"
-                )
-                blocked_script = True
-                continue
-
-            if name == "db:validate":
-                if exe == "prisma" and "validate" in args:
-                    semantic_match = True
-            elif name == "db:migrate:deploy":
-                if exe == "prisma" and "migrate" in args and "deploy" in args:
-                    semantic_match = True
-            elif name == "db:seed":
-                if exe == "prisma" and len(args) >= 2 and args[0] == "db" and args[1] == "seed":
-                    semantic_match = True
-                elif exe in JS_RUNNERS and any(
-                    re.search(r"(?:^|/)(?:prisma/)?seed(?:\.[cm]?[jt]s)?$", a) for a in args
-                ):
-                    semantic_match = True
-            elif name == "test:db":
-                joined_args = " ".join(args)
-                if exe == "npm" and ("test" in args or "run" in args):
-                    errors.append(
-                        "server/package.json scripts.test:db cannot call generic 'npm test'"
-                    )
-                    blocked_script = True
-                    continue
-                if "src/__tests__/*.test.ts" in joined_args or "health.test.ts" in joined_args:
-                    errors.append(
-                        "server/package.json scripts.test:db must target src/__tests__/database/, not generic unit tests"
-                    )
-                    blocked_script = True
-                    continue
-                is_runner = (exe == "tsx" and "--test" in args) or (
-                    exe == "node" and "--test" in args
-                )
-                targets_db_dir = any("src/__tests__/database" in a for a in args)
-                if is_runner and targets_db_dir and has_tap_reporter(args):
-                    semantic_match = True
-
-        if not blocked_script and not semantic_match:
-            if name == "db:validate":
-                errors.append("server/package.json scripts.db:validate must execute 'prisma validate'")
-            elif name == "db:migrate:deploy":
-                errors.append(
-                    "server/package.json scripts.db:migrate:deploy must execute 'prisma migrate deploy'"
-                )
-            elif name == "db:seed":
-                errors.append(
-                    "server/package.json scripts.db:seed must execute Prisma db seed or a seed script (seed.ts)"
-                )
-            elif name == "test:db":
-                errors.append(
-                    "server/package.json scripts.test:db must invoke node/tsx --test with --test-reporter=tap targeting src/__tests__/database/"
-                )
+        assert exe is not None
+        semantic_err = validator(exe, args)
+        if semantic_err:
+            errors.append(semantic_err)
 
     return errors
 
