@@ -61,6 +61,7 @@ flowchart LR
    - `WEB_BIND_ADDRESS`: pertahankan `127.0.0.1`.
    - `CLIENT_ORIGIN`: `http://localhost:5173` untuk Mode A, atau `http://127.0.0.1:8080` (atau origin HTTPS domain target) untuk Mode B.
 4. Pastikan `.env` tidak dilacak Git (`git status --short`) dan tetap masuk `.dockerignore`.
+5. Repository menggunakan satu file `.env` di root saja (**jangan** membuat `server/.env`); `server/prisma7.config.ts` memuat root `.env` secara eksplisit dengan `override: false`, sehingga variabel environment proses/CI tetap diprioritaskan di atas `.env` lokal.
 
 ---
 
@@ -122,6 +123,6 @@ npm run dev:db:down
 
 ## 6. Troubleshooting Singkat
 
-- **Backend lokal gagal konek ke database:** Pastikan `npm run dev:db:up` sudah dijalankan dan `DATABASE_URL` pada `.env` menggunakan host `127.0.0.1:5432` dengan password hex URL-safe yang identik dengan `POSTGRES_PASSWORD`.
+- **Backend lokal gagal terhubung ke database:** Pastikan `npm run dev:db:up` sudah dijalankan dan `DATABASE_URL` pada `.env` menggunakan host `127.0.0.1:5432` dengan password hex URL-safe yang identik dengan `POSTGRES_PASSWORD`.
 - **Error validasi environment saat startup `api`:** Periksa `docker compose logs api`. Pastikan `DATABASE_URL` menggunakan skema `postgres://`/`postgresql://`, `API_HOST` berupa IP/hostname valid tanpa skema URL, dan `CLIENT_ORIGIN` berupa URL `http(s)` tanpa wildcard `*`.
 - **Port `5432` atau `8080` sudah dipakai di host:** Pastikan instance database atau service lain di host tidak memakai port tersebut; untuk `web`, ubah `WEB_PORT` di `.env` (misalnya `8081`).

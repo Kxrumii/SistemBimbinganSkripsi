@@ -5,7 +5,7 @@ Aplikasi web pengajuan judul dan pemantauan proses bimbingan skripsi untuk Tugas
 - **Repository:** https://github.com/Kxrumii/SistemBimbinganSkripsi
 - **Domain target:** `https://sbs.kxrumii.my.id` *(deployment produksi dijadwalkan pada `SBS-14`)*
 
-> **Status Repository:** Fondasi aplikasi (`client/`, `server/`) dan orkestrasi container Docker Compose (`compose.yaml`, `compose.dev.yaml`) tersedia pada branch kerja `SBS-04`. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
+> **Status Repository:** Fondasi aplikasi (`client/`, `server/`), orkestrasi container Docker Compose (`compose.yaml`, `compose.dev.yaml`), serta pipeline GitHub Actions CI (`.github/workflows/ci.yml`) sudah tersedia di repository. Schema Prisma/database (`SBS-19`), autentikasi/RBAC (`SBS-05`–`SBS-06`), fitur bisnis akademik (`SBS-07`–`SBS-11`), shared frontend UI (`SBS-12`), dan deployment server (`SBS-14`) dikerjakan pada Issue masing-masing.
 
 ---
 
@@ -31,7 +31,7 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 
 - **Frontend:** React 19 + Vite + TypeScript + Tailwind CSS v4 (`client/`)
 - **Backend:** Express.js + TypeScript (`server/`)
-- **ORM:** Prisma *(integrasi schema & migrasi pada `SBS-19`)*
+- **ORM:** Prisma `7.10.1` *(integrasi konfigurasi `server/prisma7.config.ts`, schema & migrasi pada `SBS-19`)*
 - **Database:** PostgreSQL 16 (`postgres:16-alpine` pada internal Docker network)
 - **Containerization:** Docker & Docker Compose (`client/Dockerfile`, `server/Dockerfile`, `compose.yaml`, `compose.dev.yaml`)
 - **Web Serving & Reverse Proxy Kontainer:** Nginx unprivileged (`nginxinc/nginx-unprivileged:1.30.6-alpine` pada `client/nginx.conf`)
@@ -44,7 +44,15 @@ Aplikasi ini dirancang untuk mengelola alur bimbingan skripsi secara terstruktur
 ```text
 SistemBimbinganSkripsi/
 ├── .github/
-│   └── pull_request_template.md   # Template Pull Request
+│   ├── pull_request_template.md       # Template Pull Request
+│   ├── fixtures/
+│   │   └── prisma7.config.ts          # Fixture canonical config Prisma 7.10.1
+│   ├── scripts/
+│   │   ├── validate_db_contract.py    # Validator kontrak SBS-19 & output TAP
+│   │   ├── verify_prisma_root_env.py  # Uji runtime root .env pada fixture sementara
+│   │   └── test_validate_db_contract.py
+│   └── workflows/
+│       └── ci.yml                     # GitHub Actions CI (3 job checks)
 ├── .gitattributes                 # Normalisasi line ending dan aturan file biner
 ├── .gitignore                     # Pengecualian node_modules, dist, .env, dan storage
 ├── .dockerignore                  # Pengecualian artefak lokal pada build context Docker
@@ -91,6 +99,7 @@ SistemBimbinganSkripsi/
 ├── infra/
 │   └── README.md                  # Catatan batas jaringan kontainer untuk SBS-14 & SBS-15
 └── docs/
+    ├── ci.md                      # Panduan GitHub Actions CI dan troubleshooting
     ├── deployment.md              # Panduan Mode A (Dev Lokal) & Mode B (Full Compose)
     └── testing.md                 # Panduan verifikasi aplikasi, Compose, dan smoke test
 ```
@@ -110,16 +119,16 @@ SistemBimbinganSkripsi/
 
 Setiap Issue dikerjakan pada remote branch yang sudah disiapkan oleh Project Owner. **Jangan** membuat branch baru secara manual menggunakan `git switch -c`.
 
-Contoh untuk `SBS-04` (`#4`):
+Contoh checkout untuk branch Issue yang belum di-merge (ganti dengan branch Issue terkait, misalnya `issue/5-authentication-rbac` untuk `#5`):
 
 ```bash
 git clone https://github.com/Kxrumii/SistemBimbinganSkripsi.git
 cd SistemBimbinganSkripsi
 git fetch origin
-git switch --track origin/issue/4-app-foundation-docker
+git switch --track origin/issue/<nomor-issue>-<slug>
 ```
 
-Untuk anggota yang mengerjakan Issue lain, ganti `issue/4-app-foundation-docker` dengan nama branch Issue Anda sesuai daftar branch resmi tim (misalnya `issue/5-authentication-rbac` untuk `#5`). Jika branch Anda belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
+Jika branch Issue tersebut belum memiliki commit pekerjaan dan tertinggal dari `main`, jalankan `git merge --ff-only origin/main` sebelum mulai bekerja.
 
 ---
 
@@ -149,7 +158,7 @@ npm ci
    - `POSTGRES_PASSWORD`
    - segmen password pada `DATABASE_URL` (`postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>?schema=public`)
 
-> Jangan pernah meng-commit `.env` atau credential asli ke repository Git.
+> Jangan pernah meng-commit `.env` atau credential asli ke repository Git. File `.env` hanya disimpan di root repository (tidak membuat `server/.env`); konfigurasi Prisma `server/prisma7.config.ts` pada `SBS-19` memuat root `.env` secara eksplisit dengan `override: false`, sehingga variabel environment proses/CI tetap diprioritaskan.
 
 ---
 
@@ -220,8 +229,17 @@ Perintah per workspace:
 
 ---
 
+## 7. Continuous Integration (GitHub Actions)
+
+Repository dilengkapi automated CI pada [`.github/workflows/ci.yml`](.github/workflows/ci.yml) untuk setiap Pull Request menuju `main`, push ke `main`, dan trigger manual (`workflow_dispatch`). Pipeline menjalankan tiga job: **`Quality Gate`** (self-test validator, uji runtime fixture sementara Prisma `7.10.1` untuk pemuatan root `.env`, typecheck, lint, build, dan unit tests Node.js `22.x`), kemudian **`Database Integration`** (PostgreSQL Mode A `127.0.0.1:5432`, proteksi anti-hapus schema, penguncian versi Prisma `7.10.1` & canonical `server/prisma7.config.ts`, serta gate kondisional `db:validate`, `db:migrate:deploy`, `db:seed`, dan `test:db` mulai `SBS-19`) bersama **`Docker Compose Integration`** (validasi konfigurasi, build, healthcheck, smoke test, serta verifikasi isolasi port, jaringan, dan volume) secara paralel.
+
+Workflow ini tidak melakukan deployment ke server atau publish image ke container registry. Penjelasan detail kontrak database, batas baseline sebelum `SBS-19`, dan panduan troubleshooting tersedia pada [Dokumentasi CI](docs/ci.md) serta [Panduan Pengujian](docs/testing.md).
+
+---
+
 ## Dokumentasi Terkait
 
+- [Panduan GitHub Actions CI](docs/ci.md)
 - [Panduan Deployment & Mode Operasional](docs/deployment.md)
 - [Panduan & Log Pengujian](docs/testing.md)
 - [Kontrak Database (`database/README.md`)](database/README.md)

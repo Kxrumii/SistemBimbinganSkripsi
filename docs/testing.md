@@ -62,9 +62,19 @@ Daftar pemeriksaan yang wajib lulus:
 
 ---
 
-## 4. Ruang Lingkup Pengujian Issue Berikutnya
+## 4. Pemisahan Pengujian Lokal, Automated CI Checks, dan Pengujian Paket
 
-Pengujian fitur bisnis (schema/integritas database `SBS-19`, auth/JWT/CSRF/RBAC `SBS-05`–`SBS-06`, workflow akademik `SBS-07`–`SBS-11`, shared UI `SBS-12`, serta deployment domain online `SBS-13`–`SBS-15`) dilakukan pada masing-masing Issue.
+Agar cakupan verifikasi antar tahap tidak tumpang tindih dan hasil pemeriksaan tidak diklaim secara keliru, proyek membagi lapisan pengujian sebagai berikut:
+
+1. **Pengujian lokal (Developer):** Dijalankan sebelum push (`npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, serta smoke test lokal Mode A `compose.dev.yaml` atau Mode B `compose.yaml`).
+2. **`Quality Gate` (CI):** Memasang dependency dengan `npm ci`, menjalankan self-test validator kontrak CI (`test_validate_db_contract.py`), menjalankan verifikasi runtime terisolasi root `.env` Prisma `7.10.1` (`.github/scripts/verify_prisma_root_env.py` di direktori sementara tanpa menambah dependency proyek), serta menjalankan `typecheck`, `lint`, `build`, dan unit tests (`npm test`) pada Node.js `22.x`.
+3. **`Database Integration` (CI):** Memisahkan empat komponen yang berbeda:
+   - *CI validator self-tests (`test_validate_db_contract.py`):* Menguji helper `.github/scripts/validate_db_contract.py` (anti-bypass schema/migration, isi SQL, `migration_lock.toml`, kontrak script, parser AST `server/prisma7.config.ts` dengan root `.env` & `override: false`, serta parser TAP); **bukan** pengganti test database aplikasi.
+   - *PostgreSQL smoke test Mode A:* Menyalakan service `db` (`127.0.0.1:5432`) dan memverifikasi `pg_isready` serta `SELECT 1` dari host runner.
+   - *Prisma validation, migration, dan seed (`SBS-19`):* Memvalidasi pin exact versi **Prisma ORM `7.10.1`** (`prisma` dan `@prisma/client`), `package-lock.json`, canonical config `server/prisma7.config.ts`, serta menjalankan `db:validate`, `db:migrate:deploy` (`--schema=prisma/schema.prisma`), dan `db:seed` (`tsx prisma/seed.ts`) setelah `server/prisma/schema.prisma` tersedia.
+   - *Database integration & integrity tests (`SBS-19`):* Menjalankan `test:db` pada `server/src/__tests__/database/*.test.ts` (format TAP) terhadap PostgreSQL CI yang aktif dan memverifikasi minimal satu test benar-benar lulus. Validator memastikan keberadaan file test, deklarasi `test()`/`it()`, direct local executable tanpa `npx`/`npm exec` dengan exact executable & env allowlist pada `test:db`, canonical config `server/prisma7.config.ts` tanpa config alias maupun `package.json#prisma`, canonical schema path `--schema=prisma/schema.prisma`, serta ringkasan TAP, namun tidak membuktikan secara statis bahwa seluruh test mengkueri database nyata; reviewer `SBS-19` tetap wajib memastikan pengujian memakai koneksi PostgreSQL/Prisma sungguhan dan bukan mock-only suite. Pada baseline saat ini sebelum `SBS-19`, Step Summary `Database Integration` melaporkan `PostgreSQL infrastructure` dan `CI validator self-tests` sebagai **`PASS`**, sedangkan `SBS-19 schema/script/migration contract` serta `Prisma application integration` dilaporkan **`N/A`** dan belum dijalankan (kecuali bila artefak parsial `SBS-19` ditemukan tanpa schema lengkap, yang langsung menggagalkan job).
+4. **`Docker Compose Integration` (CI):** Validasi `compose.yaml` dan `compose.dev.yaml`, build image, healthcheck `db`/`api`/`web`, smoke test `/`, `/healthz`, `/api/v1/health`, `pg_isready` & `SELECT 1`, serta verifikasi isolasi port, jaringan `Internal=true`, dan mount volume.
+5. **Pengujian fitur bisnis dan deployment (`SBS-05`–`SBS-15`):** Pengujian autentikasi, alur bimbingan skripsi, upload revisi, notifikasi, serta validasi domain dan deployment online dikerjakan bertahap pada Issue masing-masing.
 
 ---
 

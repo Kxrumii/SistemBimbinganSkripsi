@@ -1,0 +1,390 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run CI database contract validator self-tests
+        id: validator_tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: Verify Prisma 7.10.1 root .env discovery
+        run: python3 .github/scripts/verify_prisma_root_env.py
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Lint workspaces
+        run: npm run lint
+
+      - name: Build client and server
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm test
+
+  database-integration:
+    name: Database Integration
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DB_COMPOSE_PROJECT: sbs-db-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run CI database contract validator self-tests
+        id: validator_tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: Prepare ephemeral DB CI environment file
+        run: |
+          umask 077
+          ENV_FILE="${RUNNER_TEMP}/sbs-db-ci.env"
+          echo "ENV_FILE=${ENV_FILE}" >> "${GITHUB_ENV}"
+          PG_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::${PG_PASSWORD}"
+          DATABASE_URL="postgresql://sbs_ci_user:${PG_PASSWORD}@127.0.0.1:5432/sbs_ci?schema=public"
+          echo "::add-mask::${DATABASE_URL}"
+          echo "DATABASE_URL=${DATABASE_URL}" >> "${GITHUB_ENV}"
+          printf '%s\n' \
+            "NODE_ENV=test" \
+            "WEB_BIND_ADDRESS=127.0.0.1" \
+            "WEB_PORT=18080" \
+            "API_PORT=3000" \
+            "CLIENT_ORIGIN=http://127.0.0.1:18080" \
+            "POSTGRES_DB=sbs_ci" \
+            "POSTGRES_USER=sbs_ci_user" \
+            "POSTGRES_PASSWORD=${PG_PASSWORD}" \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "UPLOAD_DIR=./storage/revisions" \
+            > "${ENV_FILE}"
+          chmod 600 "${ENV_FILE}"
+
+      - name: Validate Compose DB configuration
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+            -f compose.yaml -f compose.dev.yaml config --quiet
+
+      - name: Start isolated PostgreSQL service
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+            -f compose.yaml -f compose.dev.yaml up -d db
+
+      - name: Wait for PostgreSQL to become healthy
+        id: pg_health
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["DB_COMPOSE_PROJECT"]
+          cmd = [
+              "docker", "compose", "--env-file", env_file, "-p", project,
+              "-f", "compose.yaml", "-f", "compose.dev.yaml", "ps", "--format", "json",
+          ]
+
+          deadline = time.time() + 120
+          statuses = {}
+          while time.time() < deadline:
+              out = subprocess.check_output(cmd, text=True).strip()
+              rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+              statuses = {r["Service"]: (r.get("State"), r.get("Health")) for r in rows}
+              if statuses == {"db": ("running", "healthy")}:
+                  print("PostgreSQL service healthy:", statuses)
+                  raise SystemExit(0)
+              time.sleep(2)
+          raise SystemExit(f"Timed out waiting for PostgreSQL health: {statuses}")
+          PY
+
+      - name: Verify PostgreSQL port binding and host-runner connectivity
+        id: pg_connect
+        run: |
+          python3 - <<'PY'
+          import json, os, socket, subprocess
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["DB_COMPOSE_PROJECT"]
+          cmd = [
+              "docker", "compose", "--env-file", env_file, "-p", project,
+              "-f", "compose.yaml", "-f", "compose.dev.yaml", "ps", "--format", "json",
+          ]
+          rows = [json.loads(line) for line in subprocess.check_output(cmd, text=True).splitlines() if line.strip()]
+          by_service = {r["Service"]: r for r in rows}
+          assert set(by_service.keys()) == {"db"}, f"Unexpected services started: {list(by_service.keys())}"
+
+          pubs = [p for p in (by_service["db"].get("Publishers") or []) if p.get("PublishedPort", 0) != 0]
+          assert len(pubs) == 1 and pubs[0]["URL"] == "127.0.0.1" and pubs[0]["PublishedPort"] == 5432, (
+              f"Expected db bound strictly to 127.0.0.1:5432, got: {pubs}"
+          )
+
+          with socket.create_connection(("127.0.0.1", 5432), timeout=5):
+              pass
+          print("Verified PostgreSQL bound to 127.0.0.1:5432 and accepting host TCP connections.")
+          PY
+
+          PSQL_URI="${DATABASE_URL%%\?*}"
+          echo "::add-mask::${PSQL_URI}"
+          if command -v pg_isready >/dev/null 2>&1 && command -v psql >/dev/null 2>&1; then
+            pg_isready -h 127.0.0.1 -p 5432 -U sbs_ci_user -d sbs_ci
+            test "$(psql "${PSQL_URI}" -Atc "SELECT 1;")" = "1"
+            echo "Host-runner pg_isready and psql SELECT 1 succeeded on 127.0.0.1:5432."
+          else
+            docker compose --env-file "${ENV_FILE}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml exec -T db \
+              sh -c 'pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB" && test "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT 1;")" = "1"'
+            echo "Container pg_isready and psql SELECT 1 succeeded (host psql client unavailable)."
+          fi
+
+      - name: Validate Prisma schema, migrations, and script contract
+        id: db_contract
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || '') }}
+        run: |
+          python3 .github/scripts/validate_db_contract.py check-schema-and-contract \
+            --repo-root . \
+            --event-name "${EVENT_NAME}" \
+            --base-sha "${BASE_SHA}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Run Prisma validation, migration deploy, seed, and database tests
+        id: prisma_suite
+        if: steps.db_contract.outputs.run_prisma == 'true'
+        run: |
+          set -o pipefail
+          git diff --exit-code -- package-lock.json
+          python3 .github/scripts/validate_db_contract.py verify-runtime-versions --repo-root .
+          npm run db:validate --workspace=server
+          npm run db:migrate:deploy --workspace=server
+          npm run db:seed --workspace=server
+          TAP_FILE="${RUNNER_TEMP}/sbs-db-tests.tap"
+          npm run test:db --workspace=server | tee "${TAP_FILE}"
+          python3 .github/scripts/validate_db_contract.py verify-tap --tap-file "${TAP_FILE}"
+
+      - name: Collect safe diagnostics on failure
+        if: failure()
+        run: |
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-db-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml ps || true
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml logs --tail=50 db || true
+          fi
+
+      - name: Stop isolated PostgreSQL service and remove temporary env file
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/sbs-db-tests.tap"
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-db-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${DB_COMPOSE_PROJECT}" \
+              -f compose.yaml -f compose.dev.yaml down --remove-orphans || true
+            rm -f "${ENV_TARGET}"
+          fi
+
+      - name: Publish Database Integration coverage summary
+        if: always()
+        run: |
+          python3 .github/scripts/validate_db_contract.py write-summary \
+            --summary-file "${GITHUB_STEP_SUMMARY}" \
+            --validator-tests-outcome "${{ steps.validator_tests.outcome }}" \
+            --pg-health-outcome "${{ steps.pg_health.outcome }}" \
+            --pg-connect-outcome "${{ steps.pg_connect.outcome }}" \
+            --contract-outcome "${{ steps.db_contract.outcome }}" \
+            --run-prisma "${{ steps.db_contract.outputs.run_prisma }}" \
+            --prisma-outcome "${{ steps.prisma_suite.outcome }}"
+
+  docker-compose-integration:
+    name: Docker Compose Integration
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: sbs-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_WEB_PORT: "18080"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare ephemeral CI environment file
+        run: |
+          umask 077
+          ENV_FILE="${RUNNER_TEMP}/sbs-ci.env"
+          echo "ENV_FILE=${ENV_FILE}" >> "${GITHUB_ENV}"
+          PG_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::${PG_PASSWORD}"
+          printf '%s\n' \
+            "NODE_ENV=production" \
+            "WEB_BIND_ADDRESS=127.0.0.1" \
+            "WEB_PORT=${CI_WEB_PORT}" \
+            "API_PORT=3000" \
+            "CLIENT_ORIGIN=http://127.0.0.1:${CI_WEB_PORT}" \
+            "POSTGRES_DB=sbs_ci" \
+            "POSTGRES_USER=sbs_ci_user" \
+            "POSTGRES_PASSWORD=${PG_PASSWORD}" \
+            "DATABASE_URL=postgresql://sbs_ci_user:${PG_PASSWORD}@127.0.0.1:5432/sbs_ci?schema=public" \
+            "UPLOAD_DIR=./storage/revisions" \
+            > "${ENV_FILE}"
+          chmod 600 "${ENV_FILE}"
+
+      - name: Validate Compose configurations
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" \
+            -f compose.yaml config --quiet
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" \
+            -f compose.yaml -f compose.dev.yaml config --quiet
+
+      - name: Build and start full Compose stack
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" \
+            -f compose.yaml build
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" \
+            -f compose.yaml up -d
+
+      - name: Wait for all services to become healthy
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["COMPOSE_PROJECT_NAME"]
+          cmd = ["docker", "compose", "--env-file", env_file, "-p", project, "-f", "compose.yaml", "ps", "--format", "json"]
+
+          deadline = time.time() + 120
+          statuses = {}
+          while time.time() < deadline:
+              out = subprocess.check_output(cmd, text=True).strip()
+              rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+              statuses = {r["Service"]: (r.get("State"), r.get("Health")) for r in rows}
+              if set(statuses.keys()) == {"db", "api", "web"} and all(
+                  state == "running" and health == "healthy" for state, health in statuses.values()
+              ):
+                  print("All services healthy:", statuses)
+                  raise SystemExit(0)
+              time.sleep(2)
+          raise SystemExit(f"Timed out waiting for healthy services: {statuses}")
+          PY
+
+      - name: Verify web, API health, and PostgreSQL connectivity
+        run: |
+          curl -fsS "http://127.0.0.1:${CI_WEB_PORT}/" | grep -q "Sistem Bimbingan Skripsi"
+          test "$(curl -fsS "http://127.0.0.1:${CI_WEB_PORT}/healthz")" = "ok"
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          port = os.environ["CI_WEB_PORT"]
+          with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/health", timeout=10) as res:
+              assert res.status == 200, f"Unexpected status: {res.status}"
+              payload = json.loads(res.read().decode("utf-8"))
+              assert payload.get("success") is True, payload
+              data = payload.get("data", {})
+              assert data.get("status") == "ok", payload
+              assert data.get("service") == "sbs-api", payload
+              print("API health response verified:", json.dumps(payload))
+          PY
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml \
+            exec -T db sh -c 'pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB" && test "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT 1;")" = "1"'
+
+      - name: Verify network, port, and volume isolation
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          env_file = os.environ["ENV_FILE"]
+          project = os.environ["COMPOSE_PROJECT_NAME"]
+          web_port = int(os.environ["CI_WEB_PORT"])
+          ps_cmd = ["docker", "compose", "--env-file", env_file, "-p", project, "-f", "compose.yaml", "ps", "--format", "json"]
+          rows = [json.loads(line) for line in subprocess.check_output(ps_cmd, text=True).splitlines() if line.strip()]
+
+          by_service = {r["Service"]: r for r in rows}
+          assert set(by_service.keys()) == {"db", "api", "web"}, by_service.keys()
+
+          for svc in ("db", "api"):
+              pubs = [p for p in (by_service[svc].get("Publishers") or []) if p.get("PublishedPort", 0) != 0]
+              assert pubs == [], f"Unexpected host port on {svc}: {pubs}"
+
+          web_pubs = [p for p in (by_service["web"].get("Publishers") or []) if p.get("PublishedPort", 0) != 0]
+          assert len(web_pubs) == 1 and web_pubs[0]["URL"] == "127.0.0.1" and web_pubs[0]["PublishedPort"] == web_port, web_pubs
+
+          net_info = json.loads(subprocess.check_output(["docker", "network", "inspect", f"{project}_internal"], text=True))
+          assert net_info[0]["Internal"] is True, f"Expected Internal=true: {net_info[0]}"
+
+          def mounts_for(service_name: str):
+              container_id = subprocess.check_output(
+                  ["docker", "compose", "--env-file", env_file, "-p", project, "-f", "compose.yaml", "ps", "-q", service_name],
+                  text=True,
+              ).strip()
+              info = json.loads(subprocess.check_output(["docker", "inspect", container_id], text=True))
+              return info[0]["Mounts"]
+
+          db_mounts = mounts_for("db")
+          api_mounts = mounts_for("api")
+          web_mounts = mounts_for("web")
+
+          assert any(m.get("Type") == "volume" and m.get("Name") == f"{project}_sbs_pgdata" and m.get("Destination") == "/var/lib/postgresql/data" for m in db_mounts), db_mounts
+          assert any(m.get("Type") == "volume" and m.get("Name") == f"{project}_sbs_uploads" and m.get("Destination") == "/app/storage/revisions" for m in api_mounts), api_mounts
+          assert not any("sbs_uploads" in (m.get("Name") or "") or "/app/storage" in (m.get("Destination") or "") for m in web_mounts), web_mounts
+
+          print("Verified port isolation, internal network (Internal=true), and volume mounts.")
+          PY
+
+      - name: Collect safe diagnostics on failure
+        if: failure()
+        run: |
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml ps || true
+          docker compose --env-file "${ENV_FILE}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml logs --tail=50 web api || true
+
+      - name: Stop Compose stack and remove temporary env file
+        if: always()
+        run: |
+          ENV_TARGET="${ENV_FILE:-${RUNNER_TEMP}/sbs-ci.env}"
+          if [ -f "${ENV_TARGET}" ]; then
+            docker compose --env-file "${ENV_TARGET}" -p "${COMPOSE_PROJECT_NAME}" -f compose.yaml down --remove-orphans || true
+            rm -f "${ENV_TARGET}"
+          fi
